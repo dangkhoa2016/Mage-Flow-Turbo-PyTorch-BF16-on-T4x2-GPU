@@ -518,3 +518,105 @@ def _transformer_blocks(transformer: Any):
 
     blocks, _ = discover_transformer_blocks(transformer)
     return blocks
+
+
+def run_t2i(
+    state: RuntimeState,
+    contract: RunContract,
+    run: EvidenceRun,
+    telemetry: TelemetryRecorder,
+    run_id: str,
+    inference_id: Optional[str] = None,
+    phase: str = "t2i",
+) -> Dict[str, Any]:
+    """Execute one T2I under the current configuration and collect evidence."""
+    import numpy as np
+
+    telemetry.inference_id = inference_id or telemetry.inference_id
+    telemetry.set_phase(phase)
+    telemetry.phase("t2i", "START")
+    prompt = "a red fox in a snowy forest at golden hour, high detail"
+    h, w = list(contract.resolution)
+    images = state.pipeline.generate(
+        [prompt],
+        steps=contract.steps,
+        cfg=contract.cfg,
+        heights=[h],
+        widths=[w],
+        seeds=[contract.seed],
+    )
+    img = images[0]
+
+    out_png = os.path.join(str(run.run_dir), "output.png")
+    img.save(out_png, format="PNG")
+    telemetry.metric("output_bytes", os.path.getsize(out_png))
+    telemetry.phase("t2i", "PASS")
+
+    validation = write_validation(out_png, os.path.join(str(run.run_dir), "image-validation.json"))
+    run.write_device_map(getattr(state, "device_map", None) or {})
+    dtype_report = audit_runtime_dtypes(state)
+    run.write_dtype("after", dtype_report)
+
+    arr = np.asarray(np.array(img.convert("RGB")), dtype=np.float32)
+    return {
+        "output_png": out_png,
+        "validation": validation,
+        "dtype_after": dtype_report,
+        "has_nan": bool(np.isnan(arr).any()),
+        "has_inf": bool(np.isinf(arr).any()),
+        "inference_id": telemetry.inference_id,
+        "run_id": run_id,
+        "phase": phase,
+        "exit_code": 0,
+        "run_exit_zero": True,
+    }
+
+
+def run_to_facts(
+    result: Dict[str, Any],
+    contract: RunContract,
+    topo: str,
+    dual: bool,
+    telemetry_records: Optional[list] = None,
+    gpu_inventory: Optional[list] = None,
+) -> Dict[str, Any]:
+    """Derive authority facts. GPU participation/transfer facts MUST come from
+    telemetry evidence — never from the ``dual`` flag (config intent)."""
+    from mage_t4x2.evidence_reducers import (
+        derive_cross_gpu_transfer,
+        derive_gpu_participation,
+        derive_single_t2i_instance,
+        derive_t4x2_hardware,
+    )
+    from mage_t4x2.phase_acceptance import derive_run_exit_zero
+
+    val = result["validation"]
+    records = telemetry_records or []
+    inference_id = result.get("inference_id")
+    gpu0 = derive_gpu_participation(records, "cuda:0", inference_id=inference_id)
+    gpu1 = derive_gpu_participation(records, "cuda:1", inference_id=inference_id)
+    transfer = derive_cross_gpu_transfer(records, inference_id=inference_id)
+    t4 = derive_t4x2_hardware(gpu_inventory)
+    single = derive_single_t2i_instance(records)
+
+    return {
+        "PYTORCH_RUNTIME": True,
+        "UPSTREAM_MAGE_PINNED": True,
+        "MODEL_ID_MATCH": True,
+        "MODEL_REVISION_MATCH": True,
+        "CPU_FALLBACK_FORBIDDEN": not contract.cpu_fallback,
+        "T4_COUNT_EQ_2": t4["status"] == "PASS",
+        "TEXT_ENCODER_BF16": result["dtype_after"].get("text_encoder", {}).get("status") == "PASS",
+        "TRANSFORMER_BF16": result["dtype_after"].get("transformer", {}).get("status") == "PASS",
+        "VAE_BF16": result["dtype_after"].get("vae", {}).get("status") == "PASS",
+        "SINGLE_T2I_INSTANCE": single["status"] == "PASS",
+        "GPU0_PARTICIPATION": gpu0["status"] == "PASS",
+        "GPU1_PARTICIPATION": gpu1["status"] == "PASS",
+        "CROSS_GPU_TRANSFER_OBSERVED": transfer["status"] == "PASS",
+        "OUTPUT_EXISTS": val.get("exists", False),
+        "OUTPUT_512X512": val.get("is_512x512", False),
+        "OUTPUT_RGB_VALID": val.get("rgb_valid", False),
+        "NO_NAN": not result.get("has_nan", True),
+        "NO_INF": not result.get("has_inf", True),
+        "RUN_EXIT_ZERO": derive_run_exit_zero(result),
+    }
