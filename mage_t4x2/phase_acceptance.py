@@ -240,3 +240,168 @@ def derive_run_exit_zero(result: Dict[str, Any]) -> bool:
     if declared is None:
         return valid_zero
     return valid_zero and bool(declared) is valid_zero
+
+
+def derive_phase_facts(
+    phase: str,
+    result: Dict[str, Any],
+    telemetry_records: list,
+    model_load_count: int,
+    runtime_state: Any,
+    contract: Any,
+    adapter_status: Optional[Dict[str, Any]] = None,
+    replay_evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Derive observed facts from evidence. No config-intent shortcut exists."""
+    if phase == "L0":
+        memory_plan = getattr(runtime_state, "memory_plan", None) or {}
+        placement = getattr(runtime_state, "placement_validation", None) or {}
+        return {
+            "MODEL_LOAD_COUNT_EQ_1": int(model_load_count) == 1,
+            "SPREAD_LOAD_PLAN_PASS": memory_plan.get("status") == "PASS",
+            "SPREAD_LOAD_OBSERVED_PLACEMENT_PASS": bool(placement and placement.get("status") == "PASS"),
+            "NO_FULL_MODEL_CUDA0_MATERIALIZATION": bool(
+                getattr(runtime_state, "no_full_model_cuda0_materialization", False)
+            ),
+            "split_block": memory_plan.get("split_block"),
+            "single_device_rejected": memory_plan.get("single_device", {}).get("status") == "FAIL",
+        }
+
+    validation = result.get("validation") or {}
+    dtype_after = result.get("dtype_after") or {}
+    inference_id = str(result.get("inference_id") or "n/a")
+    records = telemetry_records or []
+
+    facts: Dict[str, Any] = {}
+    facts["MODEL_LOAD_COUNT_EQ_1"] = int(model_load_count) == 1
+    facts["RUN_T2I_CALLED_EQ_1"] = derive_run_t2i_called(records, inference_id)
+    facts["OUTPUT_EXISTS"] = bool(validation.get("exists"))
+    facts["OUTPUT_512X512"] = bool(validation.get("is_512x512"))
+    facts["OUTPUT_RGB_VALID"] = bool(validation.get("rgb_valid"))
+    facts["NO_NAN"] = not bool(result.get("has_nan"))
+    facts["NO_INF"] = not bool(result.get("has_inf"))
+    facts["CPU_FALLBACK_FORBIDDEN"] = not bool(getattr(contract, "cpu_fallback", False))
+    facts["RUN_EXIT_ZERO"] = derive_run_exit_zero(result)
+
+    if phase in ("G1", "ROUTING", "G3", "G4"):
+        facts["SINGLE_T2I_INSTANCE"] = derive_single_t2i_instance(records)["status"] == PASS
+        facts["GPU0_PARTICIPATION"] = (
+            derive_gpu_participation(records, "cuda:0", inference_id=inference_id)["status"] == PASS
+        )
+        facts["GPU1_PARTICIPATION"] = (
+            derive_gpu_participation(records, "cuda:1", inference_id=inference_id)["status"] == PASS
+        )
+        facts["CROSS_GPU_TRANSFER_OBSERVED"] = (
+            derive_cross_gpu_transfer(records, inference_id=inference_id)["status"] == PASS
+        )
+        block = _derive_block_integrity_facts(result, records, runtime_state, contract)
+        facts["BLOCK_ORDER_VALID"] = bool(block["BLOCK_ORDER_VALID"])
+        facts["NO_DUPLICATED_BLOCKS"] = bool(block["NO_DUPLICATED_BLOCKS"])
+        facts["NO_SKIPPED_BLOCKS"] = bool(block["NO_SKIPPED_BLOCKS"])
+        facts["BLOCK_INVOCATION_EXPECTED_COUNT"] = block.get("expected_invocations")
+        facts["BLOCK_INVOCATION_OBSERVED_COUNT"] = block.get("observed_invocations")
+        facts["BLOCK_RETURN_BOUNDARY_COUNT"] = block.get("return_boundary_count")
+        facts["BLOCK_INVOCATION_SEQUENCES"] = block.get("invocation_block_sequences")
+        facts["BLOCK_INVOCATION_ORDER_FLAGS"] = block.get("per_invocation_order_valid")
+        facts["BLOCK_INVOCATION_DUPLICATE_FLAGS"] = block.get("per_invocation_no_duplicates")
+        facts["BLOCK_INVOCATION_SKIP_FLAGS"] = block.get("per_invocation_no_skips")
+        facts["BLOCK_TRAILING_UNCLOSED_SEQUENCE"] = block.get("trailing_unclosed_blocks")
+        facts["DUAL_FORWARD_ADAPTER_ATTACHED"] = bool(
+            adapter_status and adapter_status.get("attached")
+        )
+        clean = derive_replay_cross_inference(records, inference_id)
+        facts["CROSS_INFERENCE_CLEAN"] = clean["status"] == PASS
+        facts["CROSS_INFERENCE_EVIDENCE"] = clean
+
+    if phase in ("G3", "G4"):
+        for key, component in (
+            ("TEXT_ENCODER_BF16", "text_encoder"),
+            ("TRANSFORMER_BF16", "transformer"),
+            ("VAE_BF16", "vae"),
+        ):
+            comp = dtype_after.get(component) or dtype_after.get("components", {}).get(component)
+            facts[key] = bool(comp and comp.get("status") == "PASS")
+
+    if phase == "G5":
+        rev = replay_evidence or {}
+        same_profile = bool(
+            rev.get("g4_profile") is not None
+            and rev.get("g5_profile") is not None
+            and rev.get("g4_profile") == rev.get("g5_profile")
+        )
+        same_topology = bool(
+            rev.get("g4_topology") is not None
+            and rev.get("g5_topology") is not None
+            and rev.get("g4_topology") == rev.get("g5_topology")
+        )
+        facts["REPLAY_EXECUTED"] = bool(rev.get("replay_executed"))
+        facts["FINAL_PROFILE_UNCHANGED"] = same_profile
+        facts["FINAL_TOPOLOGY_UNCHANGED"] = same_topology
+        facts["OUTPUT_VALID"] = bool(validation.get("valid")) or (
+            bool(validation.get("exists"))
+            and bool(validation.get("is_512x512"))
+            and bool(validation.get("rgb_valid"))
+            and not bool(result.get("has_nan"))
+            and not bool(result.get("has_inf"))
+        )
+        policy = evaluate_replay_policy(
+            rev.get("g4_output_path"),
+            rev.get("g5_output_path"),
+            same_profile,
+            same_topology,
+        )
+        facts["DETERMINISM_POLICY_EVALUATED"] = policy["status"] == PASS
+
+    return facts
+
+
+# ---------------------------------------------------------------------------
+# Acceptance evaluation (facts -> PASS/FAIL)
+# ---------------------------------------------------------------------------
+
+
+def evaluate_phase_acceptance(phase: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate a phase against its required field set.
+
+    A phase PASSes ONLY when every required field is present and PASS. Any
+    missing or failed field yields FAIL. Nothing here is inferable from intent.
+    """
+    required = PHASE_FIELDS.get(phase, ())
+    if not required:
+        return {
+            "phase": phase,
+            "status": NOT_RUN,
+            "note": "no acceptance fields defined for phase",
+            "fields": {},
+            "required_fields": [],
+            "provisional": True,
+        }
+
+    fields: Dict[str, Any] = {}
+    missing: list = []
+    failed: list = []
+    for field in required:
+        if field not in facts or facts[field] is None:
+            missing.append(field)
+            fields[field] = {"status": NOT_RUN, "condition_satisfied": None}
+            continue
+        ok = bool(facts[field])
+        fields[field] = {"status": PASS if ok else FAIL, "condition_satisfied": ok}
+        if not ok:
+            failed.append(field)
+
+    if missing:
+        status, note = FAIL, f"missing required facts: {missing}"
+    elif failed:
+        status, note = FAIL, f"failed fields: {failed}"
+    else:
+        status, note = PASS, "all required phase fields satisfied"
+
+    return {
+        "phase": phase,
+        "status": status,
+        "note": note,
+        "fields": fields,
+        "required_fields": list(required),
+        "provisional": bool(missing),
+    }
