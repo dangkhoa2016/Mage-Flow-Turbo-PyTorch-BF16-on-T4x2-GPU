@@ -263,3 +263,258 @@ def _validate_dtype(state: RuntimeState, key: str) -> Dict[str, Any]:
 
 def _record(state: RuntimeState, telemetry: TelemetryRecorder, action: str) -> None:
     telemetry.event("state", action=action, **state.snapshot())
+
+
+def _place_transformer(transformer: Any, plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply the complete plan (pre + blocks + post) to a live transformer.
+
+    Pre modules go to ``transformer.pre`` devices, blocks follow
+    ``transformer.blocks``, post modules follow ``transformer.post`` (they must
+    sit with the final block device). ``pos_embed`` is only moved when it carries
+    parameters/buffers.
+    """
+    import torch
+
+    tr_plan = plan["transformer"]
+    observed: Dict[str, Any] = {}
+
+    pre = tr_plan.get("pre", {})
+    for name, dev in pre.items():
+        mod = getattr(transformer, name, None)
+        if mod is not None and getattr(mod, "to", None) is not None:
+            mod.to(torch.device(dev))
+        observed[f"pre.{name}"] = dev
+
+    pos = getattr(transformer, C.TRANSFORMER_POS_EMBED_ATTR, None)
+    if pos is not None and has_parameters_or_buffers(pos) and getattr(pos, "to", None) is not None:
+        pos.to(torch.device(pre.get("img_in", "cuda:0")))
+        observed["pos_embed"] = pre.get("img_in", "cuda:0")
+
+    blocks = _transformer_blocks(transformer)
+    block_plan = tr_plan.get("blocks", {})
+    for idx, dev in [(int(i), d) for i, d in block_plan.items()]:
+        if idx < len(blocks):
+            blocks[idx].to(torch.device(dev))
+            observed[f"block.{idx}"] = dev
+
+    post = tr_plan.get("post", {})
+    for name, dev in post.items():
+        mod = getattr(transformer, name, None)
+        if mod is not None and getattr(mod, "to", None) is not None:
+            mod.to(torch.device(dev))
+        observed[f"post.{name}"] = dev
+
+    inconsistent = post_blocks_inconsistent(transformer, extract_block_devices(plan))
+    if inconsistent is not None:
+        raise RuntimeError(f"TRANSFORMER_POST_DEVICE_MISMATCH: {inconsistent}")
+    return observed
+
+
+def apply_dual_t4_mixed(state: RuntimeState, num_blocks: int, split_block: Optional[int] = None) -> Dict[str, Any]:
+    """G1/ROUTING — full dual plan: text encoder + pre + blocks[0:K) on cuda:0,
+    blocks[K:N) + post + VAE on cuda:1. Uses upstream dtypes. Never reloads.
+
+    Returns a complete A4.3 device plan. The dual-forward adapter is attached
+    separately via ``attach_dual_adapter`` (Corrective A3 adapter-owner model).
+    """
+    import torch
+
+    prior = state.snapshot()
+    plan = build_device_plan(
+        num_blocks,
+        text_encoder_device="cuda:0",
+        vae_device="cuda:1",
+        strategy="explicit" if split_block is not None else "half",
+        split_block=split_block,
+    )
+    te = state.text_encoder
+    vae = state.vae
+    if te is not None:
+        te.to(torch.device("cuda:0"))
+    if vae is not None:
+        vae.to(torch.device("cuda:1"))
+    if state.transformer is not None:
+        _place_transformer(state.transformer, plan)
+
+    state.current_profile = "mixed"
+    state.current_topology = "dual_t4"
+    state.device_map = plan["device_map_json"]  # type: ignore[attr-defined]
+    _sync_cuda()
+    _clear_disposables(state)
+    return {
+        "ok": True,
+        "prior": prior,
+        "device_plan": plan,
+        "dual_forward_adapter_attached": getattr(state, "dual_forward_adapter", None) is not None
+        and getattr(state.dual_forward_adapter, "attached", False),
+    }
+
+
+def apply_dual_t4_all_bf16(state: RuntimeState, num_blocks: int, split_block: Optional[int] = None) -> Dict[str, Any]:
+    """G4 — the integrated final target: dual-T4 + all-BF16 over the SAME live
+    transformer (identity preserved; no reload)."""
+    import torch
+
+    applied = apply_dual_t4_mixed(state, num_blocks, split_block=split_block)
+    for idx, module in enumerate(_transformer_blocks(state.transformer)):
+        module.to(torch.bfloat16)
+    if state.transformer is not None:
+        for attr in C.TRANSFORMER_PRE_MODULES:
+            mod = getattr(state.transformer, attr, None)
+            if mod is not None:
+                mod.to(torch.bfloat16)
+        for attr in C.TRANSFORMER_POST_MODULES:
+            mod = getattr(state.transformer, attr, None)
+            if mod is not None:
+                mod.to(torch.bfloat16)
+    if state.text_encoder is not None:
+        state.text_encoder.to(torch.bfloat16)
+    if state.vae is not None:
+        state.vae.to(torch.bfloat16)
+    state.current_profile = "all_bf16"
+    state.current_topology = "dual_t4"
+    _sync_cuda()
+    _clear_disposables(state)
+    report = _validate_dtype(state, "transformer")
+    applied["dtype_audit"] = report
+    applied["ok"] = report["overall_status"] == "PASS"
+    return applied
+
+
+def attach_dual_forward_adapter(state: RuntimeState, block_devices: Dict[int, str]) -> Any:
+    """Attach the upstream-compatible dual-device forward adapter (telemetry-less).
+
+    Raises RuntimeError if the adapter cannot be attached (e.g. missing block
+    container) — the caller must FAIL BEFORE INFERENCE in that case.
+    """
+    return attach_dual_adapter(
+        state,
+        {"transformer": {"blocks": {int(k): v for k, v in block_devices.items()}}},
+        telemetry=None,
+        run_id="n/a",
+        phase="routing",
+        inference_id="n/a",
+    )
+
+
+def attach_dual_adapter(
+    state: RuntimeState,
+    device_plan: Dict[str, Any],
+    telemetry: Any = None,
+    run_id: str = "n/a",
+    phase: str = "routing",
+    inference_id: str = "n/a",
+) -> Any:
+    """Attach a phase-owned dual-device forward adapter bound to the provided
+    telemetry / run_id / phase / inference_id.
+
+    Raises:
+      * RuntimeError if the transformer does not expose a block container;
+      * ADAPTER_DOUBLE_ATTACH if an adapter is already live on this transformer.
+    """
+    from mage_t4x2.dual_device_forward import DualDeviceForwardAdapter
+    from mage_t4x2.device_bridges import VaeInputBridge
+
+    if state.transformer is None:
+        raise RuntimeError("no transformer to attach dual-forward adapter to")
+    if getattr(state, "dual_forward_adapter", None) is not None and getattr(
+        state.dual_forward_adapter, "attached", False
+    ):
+        raise RuntimeError("ADAPTER_DOUBLE_ATTACH: live adapter already attached")
+    block_devices = extract_block_devices(device_plan)
+    if not block_devices:
+        raise RuntimeError("TRANSFORMER_BLOCK_ERROR: no block device mapping in plan")
+    inconsistent = post_blocks_inconsistent(state.transformer, block_devices)
+    if inconsistent is not None:
+        raise RuntimeError(f"TRANSFORMER_POST_DEVICE_MISMATCH: {inconsistent}")
+    adapter = DualDeviceForwardAdapter(
+        state.transformer,
+        block_devices,
+        telemetry=telemetry,
+        run_id=run_id,
+        phase=phase,
+        inference_id=inference_id,
+    )
+    adapter.attach()
+    state.dual_forward_adapter = adapter  # type: ignore[attr-defined]
+    if state.vae is not None:
+        bridge = VaeInputBridge(
+            state.vae,
+            telemetry=telemetry,
+            run_id=run_id,
+            phase=phase,
+            inference_id=inference_id,
+            mover=getattr(state, "vae_mover", None),
+        )
+        bridge.attach()
+        state.vae_input_bridge = bridge  # type: ignore[attr-defined]
+    return adapter
+
+
+def detach_dual_adapter(state: RuntimeState, adapter: Any = None, reason: str = "phase_end") -> bool:
+    """Safely detach the live dual-forward adapter (restores the original forward)
+    and the VAE input bridge (restores the original decode)."""
+    adapter = adapter or getattr(state, "dual_forward_adapter", None)
+    if adapter is not None and getattr(adapter, "attached", False):
+        adapter.detach()
+    state.dual_forward_adapter = None  # type: ignore[attr-defined]
+    bridge = getattr(state, "vae_input_bridge", None)
+    if bridge is not None and getattr(bridge, "attached", False):
+        bridge.detach()
+    state.vae_input_bridge = None  # type: ignore[attr-defined]
+    return True
+
+
+def create_evidence_run(run_dir: str, source_authority: Optional[Dict[str, Any]] = None) -> EvidenceRun:
+    return EvidenceRun(run_dir, source_authority=source_authority)
+
+
+def create_telemetry(path: str, run_id: str, phase: str, inference_id: str) -> TelemetryRecorder:
+    return TelemetryRecorder(path, run_id=run_id, phase=phase, inference_id=inference_id)
+
+
+def collect_telemetry(path: str) -> list:
+    from mage_t4x2.telemetry import parse_telemetry
+
+    return parse_telemetry(path)
+
+
+def derive_phase_facts(
+    phase: str,
+    result: Dict[str, Any],
+    telemetry_records: list,
+    model_load_count: int,
+    runtime_state: Any,
+    contract: RunContract,
+    adapter_status: Optional[Dict[str, Any]] = None,
+    replay_evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    from mage_t4x2.phase_acceptance import derive_phase_facts as _derive
+
+    return _derive(
+        phase,
+        result,
+        telemetry_records,
+        model_load_count,
+        runtime_state,
+        contract,
+        adapter_status=adapter_status,
+        replay_evidence=replay_evidence,
+    )
+
+
+def evaluate_phase_acceptance(phase: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    from mage_t4x2.phase_acceptance import evaluate_phase_acceptance as _evaluate
+
+    return _evaluate(phase, facts)
+
+
+def dual_forward_adapter_attached(state: RuntimeState) -> bool:
+    return bool(getattr(state, "dual_forward_adapter", None) is not None and getattr(state.dual_forward_adapter, "attached", False))
+
+
+def _transformer_blocks(transformer: Any):
+    from mage_t4x2.block_partition import discover_transformer_blocks
+
+    blocks, _ = discover_transformer_blocks(transformer)
+    return blocks
