@@ -260,3 +260,224 @@ def load_wheelhouse_manifest(
         )
 
     return data
+
+
+def verify_wheelhouse(
+    requirements_pins: List[BootstrapPin],
+    manifest_path: Optional[str] = None,
+    wheelhouse_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Verify complete wheelhouse integrity.
+
+    Checks:
+      1. manifest requirements hash matches the lock file
+      2. every manifest wheel file exists on disk
+      3. every wheel file SHA-256 matches its manifest entry
+      4. every wheel in the directory is in the manifest
+      5. every required distribution/version has an artifact
+    """
+    if manifest_path is None:
+        manifest = load_wheelhouse_manifest()
+    else:
+        manifest = load_wheelhouse_manifest(manifest_path)
+
+    if wheelhouse_dir is None:
+        whl_dir = _PROJECT_ROOT / DEFAULT_WHEELHOUSE_DIR
+    else:
+        whl_dir = Path(wheelhouse_dir).resolve()
+
+    # 1. Requirements hash match
+    actual_req_hash = requirements_sha256()
+    expected_req_hash = manifest.get("requirements_sha256")
+    req_hash_ok = actual_req_hash == expected_req_hash
+
+    # 2 & 3. Verify each manifest wheel
+    artifacts_raw = manifest.get("artifacts") or []
+    artifacts: List[WheelArtifact] = []
+    wheel_errors: List[str] = []
+    for entry in artifacts_raw:
+        art = WheelArtifact(
+            filename=entry["filename"],
+            size=entry["size"],
+            sha256=entry["sha256"],
+            distribution=entry["distribution"],
+            version=entry["version"],
+        )
+        artifacts.append(art)
+        wheel_path = whl_dir / art.filename
+        if not wheel_path.is_file():
+            wheel_errors.append(f"wheel missing: {art.filename}")
+            continue
+        actual_hash = hashlib.sha256(wheel_path.read_bytes()).hexdigest()
+        if actual_hash != art.sha256:
+            wheel_errors.append(
+                f"wheel hash mismatch: {art.filename}: "
+                f"expected {art.sha256}, got {actual_hash}"
+            )
+
+    # 4. No unmanifested artifacts
+    manifest_filenames = {a.filename for a in artifacts}
+    unmanifested: List[str] = []
+    if whl_dir.is_dir():
+        for f in whl_dir.iterdir():
+            if f.is_file() and f.name not in manifest_filenames:
+                unmanifested.append(f.name)
+
+    # 5. Every required pin has an artifact
+    missing_pins: List[str] = []
+    artifact_map = {(a.distribution.lower(), a.version): a for a in artifacts}
+    for pin in requirements_pins:
+        key = (pin.distribution.lower(), pin.version)
+        if key not in artifact_map:
+            missing_pins.append(str(pin))
+
+    ok = bool(
+        req_hash_ok
+        and not wheel_errors
+        and not unmanifested
+        and not missing_pins
+    )
+
+    return {
+        "status": "PASS" if ok else "FAIL",
+        "requirements_hash_match": req_hash_ok,
+        "expected_requirements_sha256": expected_req_hash,
+        "actual_requirements_sha256": actual_req_hash,
+        "wheel_count": len(artifacts),
+        "wheel_errors": wheel_errors,
+        "unmanifested_artifacts": unmanifested,
+        "missing_pin_artifacts": missing_pins,
+        "total_bytes": manifest.get("total_bytes", 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dependency state inspection
+# ---------------------------------------------------------------------------
+
+
+def inspect_installed_bootstrap_dependencies(
+    pins: List[BootstrapPin],
+) -> List[DependencyState]:
+    """Inspect the installed state of each pinned bootstrap dependency.
+
+    Classifies each as PRESENT_EXACT, MISSING, WRONG_VERSION_NOT_LOADED,
+    WRONG_VERSION_ALREADY_LOADED, or UNVERIFIABLE.
+    """
+    states: List[DependencyState] = []
+    for pin in pins:
+        try:
+            installed_ver = importlib.metadata.version(pin.distribution)
+        except importlib.metadata.PackageNotFoundError:
+            states.append(
+                DependencyState(
+                    distribution=pin.distribution,
+                    expected_version=pin.version,
+                    state=MISSING,
+                )
+            )
+            continue
+        except Exception:
+            states.append(
+                DependencyState(
+                    distribution=pin.distribution,
+                    expected_version=pin.version,
+                    state=UNVERIFIABLE,
+                )
+            )
+            continue
+
+        try:
+            dist = importlib.metadata.distribution(pin.distribution)
+            location = str(dist._path) if hasattr(dist, "_path") else None
+        except Exception:
+            location = None
+
+        # Check if already loaded at wrong version
+        already_loaded = False
+        mod_name = pin.distribution.replace("-", "_").lower()
+        for loaded_name, loaded_mod in list(sys.modules.items()):
+            if loaded_name.replace("-", "_").lower() == mod_name:
+                loaded_ver = getattr(loaded_mod, "__version__", None)
+                if loaded_ver and str(loaded_ver) != pin.version:
+                    already_loaded = True
+                break
+
+        if already_loaded:
+            state = WRONG_VERSION_ALREADY_LOADED
+        elif installed_ver == pin.version:
+            state = PRESENT_EXACT
+        else:
+            state = WRONG_VERSION_NOT_LOADED
+
+        states.append(
+            DependencyState(
+                distribution=pin.distribution,
+                expected_version=pin.version,
+                state=state,
+                installed_version=installed_ver,
+                installed_location=location,
+            )
+        )
+
+    return states
+
+
+# ---------------------------------------------------------------------------
+# Provisioning plan
+# ---------------------------------------------------------------------------
+
+
+def plan_bootstrap_provisioning(
+    states: List[DependencyState],
+) -> Dict[str, Any]:
+    """Determine what provisioning is needed based on dependency states.
+
+    Returns a plan with:
+      - needs_install: list of distributions needing installation
+      - fail_closed: list of distributions that force FAIL_CLOSED
+      - provisioning_needed: bool
+    """
+    needs_install: List[str] = []
+    fail_closed: List[str] = []
+
+    for ds in states:
+        if ds.state == PRESENT_EXACT:
+            continue
+        elif ds.state == MISSING:
+            needs_install.append(ds.distribution)
+        elif ds.state == WRONG_VERSION_NOT_LOADED:
+            needs_install.append(ds.distribution)
+        elif ds.state == WRONG_VERSION_ALREADY_LOADED:
+            fail_closed.append(ds.distribution)
+        elif ds.state == UNVERIFIABLE:
+            fail_closed.append(ds.distribution)
+
+    return {
+        "needs_install": needs_install,
+        "fail_closed": fail_closed,
+        "provisioning_needed": bool(needs_install),
+        "provisioning_blocked": bool(fail_closed),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Offline provisioning
+# ---------------------------------------------------------------------------
+
+
+def _check_no_network_in_args(argv: List[str]) -> None:
+    """Reject any command that could reach the network."""
+    joined = " ".join(argv)
+    for pattern in _NETWORK_URL_PATTERNS:
+        if pattern in joined:
+            raise BootstrapDependencyError(
+                NETWORK_PROVISIONING_BLOCKED,
+                f"network URL detected in provisioning command: {pattern}",
+            )
+    # Check for pip install without --no-index
+    if "pip" in joined and "install" in joined and "--no-index" not in joined:
+        raise BootstrapDependencyError(
+            NETWORK_PROVISIONING_BLOCKED,
+            "pip install without --no-index detected",
+        )
