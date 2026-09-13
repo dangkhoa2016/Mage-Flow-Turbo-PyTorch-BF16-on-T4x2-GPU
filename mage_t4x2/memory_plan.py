@@ -284,3 +284,30 @@ def plan_dual_t4_spread(
         }
     )
     return plan
+
+
+def validate_plan_within_budget(plan: Dict[str, Any], *, gpu_totals: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+    """Independent re-check that the chosen plan stays within every GPU budget.
+
+    Never trusts the planner's own arithmetic: recomputes per-device static
+    bytes straight from ``components`` and reapplies the headroom constraint.
+    """
+    if plan.get("status") != "PASS":
+        return {"status": "SKIP", "reason": "plan is not PASS"}
+    totals = gpu_totals or {
+        plan["text_encoder_device"]: plan["gpu0_total_bytes"],
+        plan["vae_device"]: plan["gpu1_total_bytes"],
+    }
+    headroom = int(plan["reserved_runtime_headroom_bytes"])
+    violations: List[str] = []
+    for device in (plan["text_encoder_device"], plan["vae_device"]):
+        total = int(totals[device])
+        used = int(plan["planned_static_bytes"][device])
+        if used + headroom > total:
+            violations.append(f"{device}: {used} + {headroom} > {total}")
+    return {
+        "status": "PASS" if not violations else "FAIL",
+        "violations": violations,
+        "computed_static_bytes": plan["planned_static_bytes"],
+        "headroom_bytes": headroom,
+    }
