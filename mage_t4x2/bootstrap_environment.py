@@ -141,3 +141,296 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def verify_bootstrap_inputs(
+    requirements_path: Any,
+    wheelhouse_dir: Any,
+    wheelhouse_manifest: Any,
+    pins: Optional[Sequence[BootstrapPin]] = None,
+) -> Dict[str, Any]:
+    """Verify bootstrap lock + wheelhouse manifest + wheelhouse bytes fail-closed.
+
+    hardened corrective (2026-09-18): the real manifest schema declares an
+    ``artifacts`` list, not a ``wheels`` mapping.  The lock SHA-256 is compared
+    against the manifest ``requirements_sha256``; every required artifact is
+    validated against actual on-disk bytes (presence, filename /
+    distribution / version, byte size, SHA-256, python-tag/platform tag); every
+    pinned requirement must have a matching artifact.  Unexpected schema
+    ambiguity is rejected.  Any integrity mismatch is appended to the
+    authoritative ``errors`` and forces top-level ``status=FAIL`` so that
+    ``prepare_bootstrap_environment`` raises before pip/provision is ever
+    reached.  Never raises for an input problem (the caller decides).
+    """
+    req = Path(requirements_path)
+    whl = Path(wheelhouse_dir)
+    manifest_path = Path(wheelhouse_manifest)
+    errors: List[str] = []
+    if not req.is_file():
+        errors.append(f"requirements bootstrap lock absent: {req}")
+    if not whl.is_dir():
+        errors.append(f"wheelhouse absent: {whl}")
+    if not manifest_path.is_file():
+        errors.append(f"wheelhouse manifest absent: {manifest_path}")
+
+    lock_sha = _sha256_file(req) if req.is_file() else None
+    manifest_sha = _sha256_file(manifest_path) if manifest_path.is_file() else None
+    wheels = sorted(whl.glob("*.whl")) if whl.is_dir() else []
+
+    resolved: List[BootstrapPin] = []
+    if pins is not None:
+        resolved = list(pins)
+    elif req.is_file():
+        try:
+            resolved = load_bootstrap_requirements(str(req))
+        except BootstrapDependencyError as exc:
+            errors.append(f"lock parse failed: {exc}")
+
+    requirements_lock_status = "FAIL"
+    if req.is_file() and resolved:
+        if all(p.version and "=" in p.raw_line for p in resolved):
+            requirements_lock_status = "PASS"
+        else:
+            errors.append("bootstrap lock contains unpinned (non-exact) requirement")
+
+    wheelhouse_integrity_status = "FAIL"
+    if manifest_path.is_file():
+        try:
+            mdoc = load_wheelhouse_manifest(str(manifest_path))
+        except Exception as exc:  # pragma: no cover - defensive
+            mdoc = {}
+            errors.append(f"wheelhouse manifest unreadable: {exc}")
+
+        if not isinstance(mdoc, dict):
+            errors.append("wheelhouse manifest root must be a JSON object")
+        else:
+            artifacts = mdoc.get("artifacts")
+            if not isinstance(artifacts, list):
+                errors.append("wheelhouse manifest must declare an 'artifacts' list")
+            else:
+                integrity_pass = True
+
+                wheels_key = mdoc.get("wheels")
+                if isinstance(wheels_key, dict):
+                    aliases = set(wheels_key.keys())
+                    artifact_names = {
+                        a.get("filename") for a in artifacts if isinstance(a, dict)
+                    }
+                    if aliases != artifact_names:
+                        errors.append(
+                            "wheelhouse manifest schema ambiguity: 'wheels' and "
+                            "'artifacts' disagree"
+                        )
+                        integrity_pass = False
+
+                expected_req_sha = mdoc.get("requirements_sha256", None)
+                if not isinstance(expected_req_sha, str) or not expected_req_sha:
+                    errors.append("wheelhouse manifest missing requirements_sha256")
+                    integrity_pass = False
+                elif lock_sha is None:
+                    errors.append("requirements bootstrap lock absent")
+                    integrity_pass = False
+                elif lock_sha != expected_req_sha:
+                    errors.append(
+                        f"manifest requirements_sha256 mismatch: expected "
+                        f"{expected_req_sha}, lock is {lock_sha}"
+                    )
+                    integrity_pass = False
+
+                artifact_map: Dict[Any, Any] = {}
+                for idx, art in enumerate(artifacts):
+                    if not isinstance(art, dict):
+                        errors.append(f"manifest artifact #{idx} is not an object")
+                        integrity_pass = False
+                        continue
+                    fname = art.get("filename")
+                    size = art.get("size")
+                    sha = art.get("sha256")
+                    dist = art.get("distribution")
+                    version = art.get("version")
+                    required_fields_ok = (
+                        isinstance(fname, str)
+                        and isinstance(size, int)
+                        and isinstance(sha, str)
+                        and isinstance(dist, str)
+                        and isinstance(version, str)
+                    )
+                    if not required_fields_ok:
+                        errors.append(
+                            f"manifest artifact #{idx} missing filename/size/"
+                            "sha256/distribution/version"
+                        )
+                        integrity_pass = False
+                        continue
+                    artifact_map[(dist.lower(), version)] = fname
+
+                    wheel_path = whl / fname
+                    if not wheel_path.is_file():
+                        errors.append(f"wheel missing from manifest: {fname}")
+                        integrity_pass = False
+                        continue
+
+                    expected_prefix = f"{dist}-{version}-"
+                    if not fname.endswith(".whl") or not fname.startswith(
+                        expected_prefix
+                    ):
+                        errors.append(
+                            "wheel filename does not match distribution/version: "
+                            f"{fname}"
+                        )
+                        integrity_pass = False
+                    else:
+                        tag_part = fname[len(expected_prefix):-4]
+                        if not any(
+                            t.startswith("py3") or t.startswith("cp3")
+                            for t in tag_part.split("-")
+                        ):
+                            errors.append(
+                                f"wheel filename python-tag/platform mismatch: {fname}"
+                            )
+                            integrity_pass = False
+
+                    actual_size = wheel_path.stat().st_size
+                    if actual_size != size:
+                        errors.append(
+                            f"wheel size mismatch: {fname}: expected {size}, got "
+                            f"{actual_size}"
+                        )
+                        integrity_pass = False
+                    actual_sha = _sha256_file(wheel_path)
+                    if actual_sha != sha:
+                        errors.append(
+                            f"wheel sha256 mismatch: {fname}: expected {sha}, got "
+                            f"{actual_sha}"
+                        )
+                        integrity_pass = False
+
+                for pin in resolved:
+                    if (pin.distribution.lower(), pin.version) not in artifact_map:
+                        errors.append(
+                            f"no manifest artifact for pinned requirement {pin}"
+                        )
+                        integrity_pass = False
+
+                if integrity_pass:
+                    wheelhouse_integrity_status = "PASS"
+    else:
+        errors.append("wheelhouse manifest unusable")
+
+    if not wheels:
+        errors.append("wheelhouse contains no wheels")
+
+    return {
+        "status": "PASS" if not errors else "FAIL",
+        "requirements_path": str(req),
+        "lock_sha256": lock_sha,
+        "manifest_sha256": manifest_sha,
+        "wheel_sha256": _sha256_file(wheels[0]) if len(wheels) == 1 else None,
+        "wheel_count": len(wheels),
+        "wheels": [w.name for w in wheels],
+        "pins": resolved,
+        "requirements_lock_status": requirements_lock_status,
+        "wheelhouse_integrity_status": wheelhouse_integrity_status,
+        "errors": errors,
+    }
+
+
+# ---------------------------------------------------------------------------
+# fresh local target policy (runbook section 23)
+# ---------------------------------------------------------------------------
+
+def create_fresh_bootstrap_site(target: Any) -> Dict[str, Any]:
+    """Create a fresh, empty local bootstrap site.
+
+    hardened corrective (2026-09-18): if the target existed before this invocation
+    it is stale and MUST fail closed with STALE_BOOTSTRAP_SITE.  A freshness
+    marker only proves the CURRENT invocation created the site; it is never a
+    reusable authorization token.  No marker may authorize reuse, and no
+    hidden delete-and-recreate behavior is allowed.
+    """
+    tgt = Path(target)
+    if tgt.exists():
+        raise BootstrapEnvironmentError(
+            f"{STALE_BOOTSTRAP_SITE}: target already exists (stale or "
+            f"pre-existing; markers never authorize reuse): {tgt}"
+        )
+    tgt.mkdir(parents=True)
+    (tgt / FRESH_TARGET_MARKER).write_text("created\n", encoding="utf-8")
+    return {"status": "PASS", "target": str(tgt), "marker": FRESH_TARGET_MARKER}
+
+
+# ---------------------------------------------------------------------------
+# offline provisioning (runbook sections 22, 24)
+# ---------------------------------------------------------------------------
+
+def provision_bootstrap_site(
+    pins: Sequence[BootstrapPin],
+    requirements_path: Any,
+    wheelhouse_dir: Any,
+    target: Any,
+) -> Dict[str, Any]:
+    """Provision the exact bootstrap lock from the local wheelhouse.
+
+    Uses the same interpreter (sys.executable) with local-only pip semantics
+    (--no-index / --find-links / --target / -r lock). The resulting installed
+    version is verified against the pins and origin residency is checked.
+    """
+    req = Path(requirements_path).resolve()
+    whl = Path(wheelhouse_dir).resolve()
+    tgt = Path(target).resolve()
+    if not tgt.is_dir():
+        raise BootstrapEnvironmentError("BOOTSTRAP_PROVISION_TARGET_MISSING: target must exist (fresh site)")
+    argv = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-index",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--find-links",
+        str(whl),
+        "--target",
+        str(tgt),
+        "-r",
+        str(req),
+    ]
+    violations = reject_network_commands(" ".join(argv))
+    if violations:
+        raise BootstrapEnvironmentError(f"BOOTSTRAP_PROVISION_NETWORK_REJECTED: {violations}")
+
+    proc = subprocess.run(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise BootstrapEnvironmentError(
+            f"BOOTSTRAP_PROVISION_PIP_FAILED: rc={proc.returncode} "
+            f"{proc.stderr.strip()[:500]}"
+        )
+
+    origin = verify_bootstrap_origins(pins=pins, target=tgt)
+    if origin["status"] != "PASS":
+        verrs = "; ".join(origin.get("errors", []))
+        raise BootstrapEnvironmentError(f"BOOTSTRAP_PROVISION_VERSION_MISMATCH: version verification mismatch: {verrs}")
+
+    return {
+        "status": "PASS",
+        "target": str(tgt),
+        "pip_argv": argv,
+        "pip_returncode": proc.returncode,
+        "installed_version": next(
+            (e["version"] for e in origin.get("entries", []) if e["distribution"] == "loguru"),
+            None,
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# local origin verification (runbook sections 24, 37)
+# ---------------------------------------------------------------------------
+
+def _normalize_dist(name: str) -> str:
+    return name.lower().replace("_", "-").replace(".", "-")
