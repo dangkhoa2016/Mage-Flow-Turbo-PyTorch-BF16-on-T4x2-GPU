@@ -281,3 +281,75 @@ def build_runtime_baseline(
     manifest.write_text(json.dumps(doc, indent=2, sort_keys=False) + "\n", encoding="utf-8")
 
     return verify_runtime_baseline(root, str(manifest))
+
+
+# ---------------------------------------------------------------------------
+# source manifest builder (authority/qualified-authority-source-manifest.json)
+# ---------------------------------------------------------------------------
+
+def build_runtime_authority_source_manifest(
+    project_root: Optional[Path] = None,
+    notebook_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Generate authority/qualified-authority-source-manifest.json after qualification.
+
+    Hashes/sizes for the qualified runtime baseline manifest, the qualified baseline
+    module, the qualified driver, the bootstrap dependency modules, requirements
+    lock, wheelhouse manifest + wheels, upstream provenance JSON, the qualified
+    runtime authority files, the qualified regression test file, and the pristine
+    qualified notebook. Returns None-with-no-write if a required source file is
+    missing (closeout tooling reports the gap); otherwise writes and returns
+    the verification record.
+    """
+    root = _default_project_root(project_root)
+    required_sources = [
+        "authority/runtime-baseline.json",
+        "mage_t4x2/runtime_baseline.py",
+        "mage_t4x2/bootstrap_dependencies.py",
+        "mage_t4x2/upstream_bootstrap.py",
+        "scripts/dual_t4_runtime_qualification.py",
+        "requirements-bootstrap.lock",
+        "vendor/bootstrap-wheelhouse-manifest.json",
+        "vendor/mage_upstream/UPSTREAM_SOURCE_PROVENANCE.json",
+        "tests/test_multistep_block_integrity_regression.py",
+        "tests/fixtures/qualified-attempt2-g1-telemetry.jsonl",
+        "tests/fixtures/qualified-attempt2-g1-fixture-provenance.json",
+    ]
+    if notebook_path:
+        required_sources.append(notebook_path)
+
+    missing = [r for r in required_sources if not (root / r).is_file()]
+    wheelhouse = root / "vendor" / "bootstrap-wheelhouse"
+    wheel_missing = not (wheelhouse.is_dir() and list(wheelhouse.glob("*.whl")))
+    if missing or wheel_missing:
+        return None
+
+    files: List[Dict[str, Any]] = []
+    for rel in required_sources:
+        p = root / rel
+        files.append({"path": rel, "size": p.stat().st_size, "sha256": _sha256(p)})
+    for w in sorted(wheelhouse.glob("*.whl")):
+        rel = w.relative_to(root).as_posix()
+        files.append({"path": rel, "size": w.stat().st_size, "sha256": _sha256(w)})
+    for entry in REQUIRED_RUNTIME_FILES:
+        p = root / entry["path"]
+        files.append(
+            {
+                "path": entry["path"],
+                "size": p.stat().st_size,
+                "sha256": _sha256(p),
+                "role": entry["role"],
+                "baseline": True,
+            }
+        )
+
+    doc = {
+        "schema_version": 1,
+        "manifest_name": "RUNTIME_AUTHORITY_SOURCE_MANIFEST",
+        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "files": files,
+    }
+    out = root / "authority" / "qualified-authority-source-manifest.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    return {"status": "PASS", "manifest_path": str(out), "files": len(files)}
