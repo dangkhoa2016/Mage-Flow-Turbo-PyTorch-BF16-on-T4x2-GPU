@@ -297,3 +297,302 @@ class StageBSession:
 
         self.state = state
         self.model_load_count += 1
+        self.model_loaded = True
+        if self.model_load_count != 1:
+            raise AuthorityViolation(
+                f"model_load_count={self.model_load_count}; authority allows exactly 1"
+            )
+        if self._sm.name == CREATED:
+            self._sm.transition(G0_PASS)
+
+        l0 = self._record_l0_result(state)
+        if l0.status != "PASS":
+            self._sm.fail(FAILED_L0)
+            raise AuthorityStateError(f"L0 spread-load acceptance failed: {l0.failure_code}")
+        self._sm.transition(L0_SPREAD_LOAD_PASS)
+        return self.state
+
+    def _record_l0_result(self, state: Any) -> PhaseResult:
+        """Run L0 acceptance on the loaded state and write L0 evidence files."""
+        from .evidence import write_json_doc
+
+        backend = self._backend()
+        observed = self._call(
+            backend, "derive_phase_facts",
+            phase="L0",
+            result={},
+            telemetry_records=[],
+            model_load_count=self.model_load_count,
+            runtime_state=state,
+            contract=self.contract,
+        )
+        acceptance = self._call(backend, "evaluate_phase_acceptance", "L0", observed)
+        l0_dir = Path(self.evidence_root) / "L0"
+        write_json_doc(str(l0_dir / "observed-facts.json"), observed)
+        write_json_doc(str(l0_dir / "acceptance.json"), acceptance)
+        write_json_doc(
+            str(l0_dir / "memory-plan.json"),
+            getattr(state, "memory_plan", None) or {},
+        )
+        write_json_doc(
+            str(l0_dir / "placement-validation.json"),
+            getattr(state, "placement_validation", None) or {},
+        )
+        result = self._finalize_result(
+            None, "L0", 0 if acceptance.get("status") == "PASS" else 1,
+            "PASS" if acceptance.get("status") == "PASS" else "FAIL",
+            observed=observed,
+            acceptance=acceptance,
+            failure_code=None if acceptance.get("status") == "PASS" else "PHASE_ACCEPTANCE_FAILED",
+            details={
+                "split_block": getattr(state, "memory_plan", {}).get("split_block"),
+                "single_device_rejected": (getattr(state, "memory_plan", {}).get("single_device") or {}).get("status") == "FAIL",
+            },
+        )
+        result.evidence_paths = {
+            "phase_result": str(l0_dir / "phase-result.json"),
+            "observed_facts": str(l0_dir / "observed-facts.json"),
+            "acceptance": str(l0_dir / "acceptance.json"),
+            "memory_plan": str(l0_dir / "memory-plan.json"),
+            "placement_validation": str(l0_dir / "placement-validation.json"),
+        }
+        result.save(str(l0_dir / "phase-result.json"))
+        return result
+
+    def _load_with_backend(self, backend: Any, model_path: str) -> Any:
+        return self._call(backend, "load_runtime_state", model_path, self.contract, self.source_authority)
+
+    # -- backend dispatch --------------------------------------------------
+    def _backend(self) -> Any:
+        if self._beam is None:
+            from scripts import gpu_session  # type: ignore
+
+            self._beam = {
+                "load_runtime_state": gpu_session.load_runtime_state,
+                "preflight_gpu": gpu_session.preflight_gpu,
+                "apply_dual_t4_mixed": gpu_session.apply_dual_t4_mixed,
+                "apply_dual_t4_all_bf16": gpu_session.apply_dual_t4_all_bf16,
+                "create_evidence_run": gpu_session.create_evidence_run,
+                "create_telemetry": gpu_session.create_telemetry,
+                "attach_dual_adapter": gpu_session.attach_dual_adapter,
+                "detach_dual_adapter": gpu_session.detach_dual_adapter,
+                "run_t2i": gpu_session.run_t2i,
+                "collect_telemetry": gpu_session.collect_telemetry,
+                "derive_phase_facts": gpu_session.derive_phase_facts,
+                "evaluate_phase_acceptance": gpu_session.evaluate_phase_acceptance,
+                "resolve_model_path": gpu_session.resolve_model_path,
+                "run_to_facts": gpu_session.run_to_facts,
+            }
+        return self._beam
+
+    @staticmethod
+    def _call(backend: Any, name: str, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(backend, dict) or hasattr(backend, "__getitem__"):
+            fn = backend[name]
+        else:
+            fn = getattr(backend, name)
+        return fn(*args, **kwargs)
+
+    # -- phase context -----------------------------------------------------
+    def _new_phase_context(self, phase: str) -> PhaseContext:
+        backend = self._backend()
+        inference_id = self._new_inference_id()
+        run_dir = Path(self.evidence_root) / phase
+        evidence_run = self._call(backend, "create_evidence_run", str(run_dir), self.source_authority)
+        telemetry = self._call(
+            backend, "create_telemetry",
+            str(run_dir / "telemetry.jsonl"),
+            run_id=self.session_id,
+            phase=phase,
+            inference_id=inference_id,
+        )
+        return PhaseContext(
+            phase=phase,
+            run_id=self.session_id,
+            inference_id=inference_id,
+            evidence_run=evidence_run,
+            telemetry=telemetry,
+            run_dir=str(run_dir),
+        )
+
+    # -- adapter ownership / structural truth ------------------------------
+    def _ensure_no_active_adapter(self, phase: str) -> None:
+        """Never stack monkeypatches: safely detach any stale live adapter."""
+        if self.active_dual_adapter is not None:
+            adapter = self.active_dual_adapter
+            if getattr(adapter, "attached", False):
+                self._detach_adapter(reason=f"{phase}_pre_attach_cleanup")
+            else:
+                self.active_dual_adapter = None
+
+    def _attach_adapter(self, ctx: PhaseContext, plan: Optional[Dict[str, Any]]) -> Any:
+        from mage_t4x2.device_plan import extract_block_devices
+
+        backend = self._backend()
+        adapter = self._call(
+            backend, "attach_dual_adapter",
+            self.state,
+            plan,
+            ctx.telemetry,
+            ctx.run_id,
+            ctx.phase,
+            ctx.inference_id,
+        )
+        self.active_dual_adapter = adapter
+        self._current_block_devices = extract_block_devices(plan)
+        return adapter
+
+    def _detach_adapter(self, reason: str = "phase_end") -> None:
+        backend = self._backend()
+        adapter = self.active_dual_adapter
+        try:
+            self._call(backend, "detach_dual_adapter", self.state, adapter, reason=reason)
+        except Exception:
+            # Detach is best-effort; the reference is cleared regardless.
+            if adapter is not None and getattr(adapter, "attached", False):
+                adapter.detach()
+        self.active_dual_adapter = None
+        self._current_block_devices = {}
+
+    def _adapter_status(self, ctx: PhaseContext) -> Dict[str, Any]:
+        """Adapter truth is observed, not declared (Corrective A3 section 7)."""
+        adapter = self.active_dual_adapter
+        attrs = {
+            "active_adapter_exists": adapter is not None,
+            "attached": bool(adapter is not None and getattr(adapter, "attached", False)),
+            "transformer_matches": bool(
+                adapter is not None and adapter.transformer is self.state.transformer
+            ),
+            "patched_forward": bool(
+                adapter is not None
+                and getattr(adapter, "attached", False)
+                and getattr(adapter.transformer, "forward", None)
+                is not getattr(adapter, "_original_forward", object())
+            ),
+            "block_map_matches": bool(
+                adapter is not None
+                and adapter.block_devices == self._current_block_devices
+            ),
+            "telemetry_run_id_matches": bool(
+                adapter is not None
+                and getattr(adapter.telemetry, "run_id", None) == ctx.run_id
+            ),
+            "telemetry_phase_matches": bool(
+                adapter is not None
+                and getattr(adapter.telemetry, "_phase", None) == ctx.phase
+            ),
+            "telemetry_inference_id_matches": bool(
+                adapter is not None
+                and getattr(adapter.telemetry, "inference_id", None) == ctx.inference_id
+            ),
+        }
+        attrs["check_summary"] = all(attrs.values())
+        return attrs
+
+    # -- phase runner (canonical lifecycle) --------------------------------
+    def _execute_phase(
+        self,
+        phase: str,
+        pass_state: str,
+        failed_state: str,
+        config_fn: Callable[[PhaseContext, Any], Dict[str, Any]],
+        require_dual_adapter: bool = False,
+        replay: bool = False,
+    ) -> PhaseResult:
+        backend = self._backend()
+        ctx: Optional[PhaseContext] = None
+        detach_done = False
+        try:
+            self._assert_index()
+            ctx = self._new_phase_context(phase)
+            applied = config_fn(ctx, backend) or {}
+
+            adapter_status: Optional[Dict[str, Any]] = None
+            if require_dual_adapter:
+                plan = applied.get("device_plan")
+                if plan is None and self._last_dual_plan is not None:
+                    plan = self._last_dual_plan
+                if plan is None:
+                    plan = {"transformer": {"blocks": dict(self._current_block_devices)}}
+                self._ensure_no_active_adapter(phase)
+                self._attach_adapter(ctx, plan)
+                adapter_status = self._adapter_status(ctx)
+                if not adapter_status.get("attached"):
+                    self._sm.fail(failed_state)
+                    return self._fail_result(
+                        ctx, phase, "DUAL_FORWARD_ADAPTER_MISSING",
+                        details={"adapter_status": adapter_status},
+                    )
+
+            self._inference_calls[phase] = self._inference_calls.get(phase, 0) + 1
+            result = self._call(
+                backend, "run_t2i",
+                self.state, self.contract, ctx.evidence_run, ctx.telemetry,
+                self.session_id,
+                inference_id=ctx.inference_id,
+                phase=phase,
+            )
+            if not self._validate_inference_result(result):
+                self._sm.fail(failed_state)
+                return self._fail_result(
+                    ctx, phase, "INFERENCE_NOT_EXECUTED",
+                    details={"explanation": "backend returned no executable inference evidence", "result": result},
+                )
+
+            telemetry_records = self._call(backend, "collect_telemetry", ctx.telemetry_path)
+            observed = self._call(
+                backend, "derive_phase_facts",
+                phase=phase,
+                result=result,
+                telemetry_records=telemetry_records,
+                model_load_count=self.model_load_count,
+                runtime_state=self.state,
+                contract=self.contract,
+                adapter_status=adapter_status,
+                replay_evidence=self._replay_evidence(phase, ctx, result) if replay else None,
+            )
+            acceptance = self._call(backend, "evaluate_phase_acceptance", phase, observed)
+            self._write_phase_evidence(ctx, result, observed, acceptance)
+            self._record_replay_state(phase, ctx, result)
+
+            if require_dual_adapter:
+                self._detach_adapter(reason=f"{phase}_exit")
+                detach_done = True
+
+            if acceptance.get("status") != "PASS":
+                self._sm.fail(failed_state)
+                return self._fail_result(
+                    ctx, phase, "PHASE_ACCEPTANCE_FAILED",
+                    observed=observed,
+                    acceptance=acceptance,
+                    details={"acceptance": acceptance},
+                )
+
+            self._sm.transition(pass_state)
+            return self._pass_result(
+                ctx, phase, observed=observed, acceptance=acceptance,
+                output_path=result.get("output_png"),
+            )
+        except Exception as exc:
+            if ctx is not None and require_dual_adapter and not detach_done:
+                try:
+                    self._detach_adapter(reason=f"{phase}_exception_cleanup")
+                except Exception:
+                    pass
+            code = self._classify_failure(exc)
+            try:
+                self._sm.fail(failed_state)
+            except AuthorityStateError:
+                pass
+            return self._fail_result(ctx, phase, code, details={"error": str(exc)})
+
+    def _validate_inference_result(self, result: Optional[Dict[str, Any]]) -> bool:
+        if result is None:
+            return False
+        val = result.get("validation") or {}
+        if not val.get("exists"):
+            return False
+        if not result.get("output_png"):
+            return False
+        return True
+
