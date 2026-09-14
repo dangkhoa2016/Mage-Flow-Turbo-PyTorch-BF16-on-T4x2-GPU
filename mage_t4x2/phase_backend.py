@@ -290,3 +290,249 @@ class SyntheticPhaseBackend:
         if self.scenario == "post_device_mismatch":
             raise RuntimeError("TRANSFORMER_POST_DEVICE_MISMATCH: synthetic post module on wrong device")
         block_devices = extract_block_devices(device_plan)
+        adapter = DualDeviceForwardAdapter(
+            state.transformer,
+            block_devices,
+            transfer_helper=CrossDeviceTransferHelper(
+                mover=_cpu_mover,
+                run_id=run_id,
+                phase=phase,
+                inference_id=inference_id,
+            ),
+            telemetry=_CaptureTelemetry(run_id, phase, inference_id),
+            run_id=run_id,
+            phase=phase,
+            inference_id=inference_id,
+        )
+        adapter.attach()
+        state.dual_forward_adapter = adapter
+        state.dual_forward_adapter_attached = True
+        self.adapters.append(adapter)
+        self.block_devices_per_phase[phase] = block_devices.copy()
+        self.attach_count += 1
+        return adapter
+
+    def detach_dual_adapter(self, state: Any, adapter: Any = None, reason: str = "phase_end") -> bool:
+        adapter = adapter or getattr(state, "dual_forward_adapter", None)
+        if adapter is not None and getattr(adapter, "attached", False):
+            adapter.detach()
+        if state is not None:
+            state.dual_forward_adapter = None
+            state.dual_forward_adapter_attached = False
+        self.detach_count += 1
+        self.detach_reasons.append(reason)
+        return True
+
+    # -- run one T2I -------------------------------------------------------
+    def run_t2i(
+        self,
+        state: SyntheticRuntimeState,
+        contract: RunContract,
+        run: EvidenceRun,
+        telemetry: TelemetryRecorder,
+        run_id: str,
+        inference_id: Optional[str] = None,
+        phase: str = "t2i",
+    ) -> Dict[str, Any]:
+        self.run_t2i_call_count += 1
+        self.phase_inference_calls[phase] = self.phase_inference_calls.get(phase, 0) + 1
+        self.state_ids.append(id(state))
+        self.inference_ids[phase] = inference_id or telemetry.inference_id or "n/a"
+
+        if self.scenario == "run_t2i_exception":
+            telemetry.phase("t2i", "START")
+            raise RuntimeError(f"run_t2i synthetic failure in {phase}")
+
+        if self.scenario == "no_inference":
+            self._no_inference_telemetry(telemetry, run_id, phase, inference_id)
+            return {
+                "output_png": None,
+                "validation": {"exists": False, "error": "no_inference"},
+                "dtype_after": self._dtype_report(state),
+                "has_nan": True,
+                "has_inf": False,
+                "inference_id": inference_id or telemetry.inference_id,
+                "run_id": run_id,
+                "phase": phase,
+                "run_exit_zero": True,
+            }
+
+        # Run the partitioned/reference forward once per contract denoising
+        # step (multistep parity with the real backend: each step emits a full
+        # transformer block sequence plus one return-transfer boundary).
+        steps = int(getattr(contract, "steps", 0) or 0)
+        if steps <= 0:
+            steps = 1
+        capture = self._capture_forward(state, phase, steps=steps)
+
+        # Apply scenario transforms on captured evidence.
+        records = self._transform_records(capture, run_id, phase, inference_id)
+
+        # Write the real telemetry file.
+        for rec in records:
+            telemetry.event(rec["event"], **{k: v for k, v in rec.items() if k != "event"})
+        telemetry.close()
+
+        # Output image.
+        invalid = self.scenario == "invalid_output"
+        out_png = str(run.run_dir / "output.png")
+        if invalid:
+            image_validation.make_fixture_png(out_png, width=32, height=32)
+        else:
+            image_validation.make_fixture_png(out_png, width=512, height=512)
+
+        validation = image_validation.validate_image(out_png)
+        run.write_image_validation(validation)
+        run.write_device_map(getattr(state, "device_map", None) or {})
+        dtype_after = self._dtype_report(state)
+        run.write_dtype("after", dtype_after)
+
+        return {
+            "output_png": out_png,
+            "validation": validation,
+            "dtype_after": dtype_after,
+            "has_nan": bool(validation.get("has_nan")),
+            "has_inf": bool(validation.get("has_inf")),
+            "inference_id": inference_id or telemetry.inference_id,
+            "run_id": run_id,
+            "phase": phase,
+            "run_exit_zero": True,
+            "exit_code": 0,
+        }
+
+    def _no_inference_telemetry(self, telemetry: TelemetryRecorder, run_id: str, phase: str, inference_id: Optional[str]) -> None:
+        telemetry.event(
+            "phase",
+            phase="t2i",
+            status="START",
+            run_id=run_id,
+            inference_id=inference_id,
+        )
+        telemetry.close()
+
+    def _capture_forward(self, state: SyntheticRuntimeState, phase: str, steps: int = 1) -> _CaptureTelemetry:
+        """Run one real forward per contract step through the (possibly)
+        attached adapter so routing evidence is genuinely produced, not
+        hard-coded. Each step emits the full transformer block sequence plus one
+        ``transformer_output_return_transfer`` boundary (and its cross-device
+        transfer at the split boundary), mirroring the real backend's per-step
+        ``pipeline.generate`` invocation."""
+        capture: _CaptureTelemetry = _CaptureTelemetry("capture", phase, "capture")
+
+        # Caller device is cuda:0 (image carrier); final transformer device is
+        # the last block's device per the live plan. On the CPU synthetic the
+        # adapter's return bridge never fires (payload devices resolve to
+        # ``cpu``), so the per-step return boundary is emitted here to preserve
+        # parity with the real GPU backend.
+        caller_device = "cuda:0"
+        transformer_map = getattr(state, "device_map", {}).get("transformer") or {}
+        block_devices = {int(k): str(v) for k, v in transformer_map.items()}
+        if block_devices:
+            last_block_device = block_devices[max(block_devices)]
+
+        adapter = getattr(state, "dual_forward_adapter", None)
+        if adapter is not None and getattr(adapter, "attached", False):
+            prev = adapter.telemetry
+            prev_transfer = adapter.transfer_helper.telemetry
+            adapter.telemetry = capture
+            adapter.transfer_helper.telemetry = capture
+            try:
+                for _ in range(steps):
+                    self._forward(state, capture)
+                    if last_block_device is not None and last_block_device != caller_device:
+                        capture.event(
+                            "transformer_output_return_transfer",
+                            from_=last_block_device,
+                            to=caller_device,
+                        )
+            finally:
+                adapter.telemetry = prev
+                adapter.transfer_helper.telemetry = prev
+        else:
+            for _ in range(steps):
+                self._forward(state, capture)
+                if last_block_device is not None and last_block_device != caller_device:
+                    capture.event(
+                        "transformer_output_return_transfer",
+                        from_=last_block_device,
+                        to=caller_device,
+                    )
+        return capture
+
+    def _forward(self, state: SyntheticRuntimeState, capture: _CaptureTelemetry) -> Any:
+        import torch
+
+        synth = state.transformer
+        img = torch.randn(1, 16, 8)
+        txt = torch.randn(1, 8, 8)
+        timesteps = torch.full((1,), 0.42)
+        cu_i = torch.tensor([0, 16], dtype=torch.int32)
+        cu_t = torch.tensor([0, 8], dtype=torch.int32)
+        shapes = [[(1, 4, 4)]]
+        return synth.forward(img, txt, timesteps, shapes, cu_i, cu_t)
+
+    def _transform_records(
+        self,
+        capture: _CaptureTelemetry,
+        run_id: str,
+        phase: str,
+        inference_id: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        records: List[Dict[str, Any]] = []
+        records.append({"event": "phase", "phase": "t2i", "status": "START", "run_id": run_id, "inference_id": inference_id})
+        for rec in capture.records:
+            if rec.get("event") == "metric":
+                continue
+            normalized = dict(rec)
+            normalized["run_id"] = run_id
+            normalized["phase"] = phase
+            normalized["inference_id"] = inference_id
+            records.append(normalized)
+        records.append({"event": "phase", "phase": "t2i", "status": "PASS", "run_id": run_id, "inference_id": inference_id})
+        if self.scenario == "second_model_load":
+            records.append({"event": "model_load", "load_index": 2, "run_id": run_id, "phase": phase, "inference_id": inference_id})
+
+        if self.scenario == "wrong_inference_id":
+            wrong = "t2i-WRONG-INFERENCE"
+            for rec in records:
+                rec["inference_id"] = wrong
+        if self.scenario == "missing_transfer":
+            records = [r for r in records if r.get("event") != "cross_device_transfer"]
+        elif self.scenario == "duplicate_block":
+            first_block = next((i for i, r in enumerate(records) if r.get("event") == "block_forward"), None)
+            if first_block is not None:
+                dup = dict(records[first_block])
+                records.insert(first_block + 1, dup)
+        elif self.scenario == "skipped_block":
+            dropped = False
+            kept = []
+            for r in records:
+                if not dropped and r.get("event") == "block_forward" and int(r.get("block", -1)) == 5:
+                    dropped = True
+                    continue
+                kept.append(r)
+            records = kept
+        return records
+
+    # -- facts + acceptance ------------------------------------------------
+    def derive_phase_facts(self, phase: str, result: Dict[str, Any], telemetry_records: list, model_load_count: int, runtime_state: Any, contract: Any, adapter_status: Optional[Dict[str, Any]] = None, replay_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        from .phase_acceptance import derive_phase_facts as _derive
+
+        return _derive(
+            phase,
+            result,
+            telemetry_records,
+            model_load_count,
+            runtime_state,
+            contract,
+            adapter_status=adapter_status,
+            replay_evidence=replay_evidence,
+        )
+
+    def evaluate_phase_acceptance(self, phase: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+        from .phase_acceptance import evaluate_phase_acceptance as _evaluate
+
+        return _evaluate(phase, facts)
+
+    def run_to_facts(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return {"PYTORCH_RUNTIME": True}
