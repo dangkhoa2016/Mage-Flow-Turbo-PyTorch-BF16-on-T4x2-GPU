@@ -595,3 +595,297 @@ def derive_split_boundary_endpoints(
     if split_block is None:
         out = dict(missing)
         out["reason"] = "split_block_missing"
+        return out
+    try:
+        k = int(split_block)
+    except (TypeError, ValueError):
+        out = dict(missing)
+        out["reason"] = "split_block_invalid"
+        return out
+    if k < 1:
+        out = dict(missing)
+        out["reason"] = "split_block_lt_1"
+        return out
+    if k >= num_blocks:
+        out = dict(missing)
+        out["reason"] = "split_block_out_of_range"
+        return out
+    key_from = str(k - 1)
+    key_to = str(k)
+    if key_from not in bd or key_to not in bd:
+        out = dict(missing)
+        out["from_block"] = k - 1
+        out["to_block"] = k
+        out["reason"] = "boundary_block_missing"
+        return out
+    expected_from = str(bd[key_from])
+    expected_to = str(bd[key_to])
+    base = {
+        "found": True,
+        "expected_from": expected_from,
+        "expected_to": expected_to,
+        "from_block": k - 1,
+        "to_block": k,
+    }
+    if expected_from == expected_to:
+        out = dict(base)
+        out["validated"] = False
+        out["reason"] = "boundary_devices_equal"
+        return out
+    if not (expected_from.startswith("cuda:") and expected_to.startswith("cuda:")):
+        out = dict(base)
+        out["validated"] = False
+        out["reason"] = "boundary_endpoint_non_cuda"
+        return out
+    out = dict(base)
+    out["validated"] = True
+    out["reason"] = None
+    return out
+
+
+def derive_latent_anchor_device(
+    live_placements: Dict[str, Any],
+    memory_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Latent/caller anchor from the LIVE transformer-pre authority.
+
+    The anchor is the discrete CUDA device of the transformer-pre input/caller
+    modules (img_in first).  When live evidence is unavailable, the canonical
+    single-consistent transformer-pre plan placement corroborates; a
+    contradictory or absent anchor is UNPROVEN and fails closed.
+    """
+    lp = live_placements or {}
+    pre = lp.get("transformer_pre") or {}
+    candidates: List[Tuple[str, str]] = []
+    for name in C.TRANSFORMER_PRE_MODULES:
+        sig = pre.get(name) or {}
+        if sig.get("present") and not sig.get("parameterless"):
+            device = sig.get("discrete_device")
+            if device is not None and str(device).startswith("cuda:"):
+                candidates.append((str(name), str(device)))
+    if candidates:
+        distinct = sorted({d for _n, d in candidates})
+        if len(distinct) == 1:
+            name = next(n for n, d in candidates if d == distinct[0])
+            return {
+                "anchor_device": distinct[0],
+                "source": "live_transformer_pre." + name,
+                "unproven": False,
+                "reason": None,
+            }
+        return {
+            "anchor_device": None,
+            "source": "live_transformer_pre_ambiguous",
+            "unproven": True,
+            "reason": "live transformer-pre devices disagree",
+        }
+    m = memory_plan or {}
+    components = m.get("components") or {}
+    device_plan = m.get("device_plan") or {}
+    tr_plan = device_plan.get("transformer") or {}
+    plan_values: List[str] = []
+    comp_dev = (components.get("transformer_pre") or {}).get("device")
+    if comp_dev is not None:
+        plan_values.append(str(comp_dev))
+    for _name, dev in (tr_plan.get("pre") or {}).items():
+        if dev is not None:
+            plan_values.append(str(dev))
+    distinct_plan = sorted(set(plan_values))
+    if distinct_plan and len(distinct_plan) == 1 and distinct_plan[0].startswith("cuda:"):
+        return {
+            "anchor_device": distinct_plan[0],
+            "source": "plan_transformer_pre",
+            "unproven": False,
+            "reason": None,
+        }
+    return {
+        "anchor_device": None,
+        "source": "unproven",
+        "unproven": True,
+        "reason": "latent anchor unproven",
+    }
+
+
+def derive_post_head_device_expected(
+    memory_plan: Dict[str, Any],
+    live_post: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Post/head expected device cross-check (plan + final block + live post).
+
+    Every corroborating source must agree on a single CUDA device: plan
+    ``device_plan.transformer.post`` entries, ``components.transformer_post``,
+    the planned ``final_block_device``, and (when available) the live post
+    modules.  Disagreements are reported per source and FAIL the check.
+    """
+    m = memory_plan or {}
+    components = m.get("components") or {}
+    device_plan = m.get("device_plan") or {}
+    tr_plan = device_plan.get("transformer") or {}
+    post_plan = tr_plan.get("post") or {}
+    comp_post = components.get("transformer_post") or {}
+    final_block_device = device_plan.get("final_block_device")
+    sources: List[Tuple[str, str]] = []
+    if isinstance(post_plan, dict):
+        for name, dev in post_plan.items():
+            if dev is not None:
+                sources.append(("plan_post." + str(name), str(dev)))
+    comp_dev = comp_post.get("device")
+    if comp_dev is not None:
+        sources.append(("components_transformer_post", str(comp_dev)))
+    primary_present = bool(sources)
+    if final_block_device is not None:
+        sources.append(("final_block_device", str(final_block_device)))
+    uniform = primary_present and len({v for _s, v in sources}) == 1
+    expected = sources[0][1] if primary_present else None
+    expected_cuda = bool(expected) and str(expected).startswith("cuda:")
+    disagreement: List[str] = []
+    if expected is not None:
+        for label, dev in sources:
+            if dev != expected:
+                disagreement.append(label + "=" + dev)
+    live_present = live_post is not None
+    if live_present:
+        for name, sig in live_post.items():
+            if not isinstance(sig, dict):
+                continue
+            device = sig.get("discrete_device")
+            if device is not None and str(device) != expected:
+                disagreement.append("live_post." + str(name) + "=" + str(device))
+    valid = bool(primary_present and uniform and expected_cuda and not disagreement)
+    if not live_present:
+        valid = False
+        disagreement.append("live_post=missing")
+    return {
+        "expected": expected,
+        "valid": valid,
+        "uniform": uniform,
+        "cuda": expected_cuda,
+        "sources": {label: dev for label, dev in sources},
+        "disagreement": disagreement,
+        "live_post_present": live_present,
+        "reason": None if valid else "post_head_expected_disagreement",
+    }
+
+
+def derive_live_vs_plan_placement_match(
+    live_placements: Dict[str, Any],
+    memory_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Per-path live-vs-plan placement consistency over the authority path.
+
+    Every live discrete device is compared to its plan expectation; a live
+    device that is missing, ambiguous, or different fails the match.
+    """
+    m = memory_plan or {}
+    components = m.get("components") or {}
+    device_plan = m.get("device_plan") or {}
+    tr_plan = device_plan.get("transformer") or {}
+    pre_plan = tr_plan.get("pre") or {}
+    post_plan = tr_plan.get("post") or {}
+    block_devices = m.get("block_devices") or {}
+    checked: Dict[str, Any] = {}
+    mismatches: List[str] = []
+
+    def _cmp(path: str, live: Any, planned: Any) -> None:
+        lv = str(live) if live is not None else None
+        pv = str(planned) if planned is not None else None
+        checked[path] = {"live": lv, "plan": pv}
+        if lv != pv:
+            mismatches.append(f"{path}: live={lv} plan={pv}")
+
+    lp = live_placements or {}
+    _cmp(
+        "text_encoder",
+        (lp.get("text_encoder") or {}).get("discrete_device"),
+        (components.get("text_encoder") or {}).get("device"),
+    )
+    pre_default = (components.get("transformer_pre") or {}).get("device")
+    for name, sig in (lp.get("transformer_pre") or {}).items():
+        plan_value = (pre_plan or {}).get(name)
+        if plan_value is None:
+            plan_value = pre_default
+        _cmp("transformer.pre." + str(name), sig.get("discrete_device"), plan_value)
+    for idx, sig in (lp.get("transformer_blocks") or {}).items():
+        _cmp(
+            "transformer.blocks." + str(idx),
+            sig.get("discrete_device"),
+            block_devices.get(str(idx)),
+        )
+    post_default = (components.get("transformer_post") or {}).get("device")
+    for name, sig in (lp.get("transformer_post") or {}).items():
+        plan_value = (post_plan or {}).get(name)
+        if plan_value is None:
+            plan_value = post_default
+        _cmp("transformer.post." + str(name), sig.get("discrete_device"), plan_value)
+    _cmp(
+        "vae",
+        (lp.get("vae") or {}).get("discrete_device"),
+        (components.get("vae") or {}).get("device"),
+    )
+    return {"match": not mismatches, "mismatches": mismatches, "checked": checked}
+
+
+def adjudicate_transfer_cardinality(
+    events: List[Dict[str, Any]],
+    from_device: str,
+    to_device: str,
+    expected_count: int,
+) -> Dict[str, Any]:
+    """STRICT transfer cardinality over scoped events.
+
+    PASS requires the observed event count to equal the EXPLICIT expected count
+    AND every event to satisfy ``from == from_device, to == to_device,
+    from != to``.  Zero events FAIL.  The expected count is never derived from
+    the observed length.
+    """
+    events = events or []
+    expected = int(expected_count)
+    violations: List[Dict[str, Any]] = []
+    for ev in events:
+        frm = str(ev.get("from"))
+        to = str(ev.get("to"))
+        if not (
+            frm == str(from_device)
+            and to == str(to_device)
+            and frm != to
+        ):
+            violations.append({"from": frm, "to": to})
+    exact_count = len(events) == expected
+    ok = bool(events) and exact_count and not violations
+    return {
+        "pass": ok,
+        "event_count": len(events),
+        "expected_count": expected,
+        "exact_count": exact_count,
+        "violation_count": len(violations),
+        "violations": violations,
+    }
+
+
+def adjudicate_post_head_device(
+    return_events: List[Dict[str, Any]],
+    expected_device: str,
+    expected_count: int,
+    anchor_device: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Post/head device proof over the transformer-output-return witness.
+
+    PASS requires every return event to originate on the live-expected post/head
+    device (and, when known, to land on the live latent-anchor device), with the
+    observed count equal to N.  Missing/mixed/CPU evidence FAILs.
+    """
+    events = return_events or []
+    expected = int(expected_count)
+    violations: List[Dict[str, Any]] = []
+    from_devices = sorted({str(ev.get("from")) for ev in events})
+    for ev in events:
+        frm = str(ev.get("from"))
+        to = str(ev.get("to"))
+        ok_from = frm == str(expected_device)
+        ok_to = True
+        if anchor_device:
+            ok_to = to == str(anchor_device)
+        if not (ok_from and ok_to and frm != to):
+            violations.append({"from": frm, "to": to})
+    exact_count = len(events) == expected
+    ok = bool(events) and exact_count and not violations
