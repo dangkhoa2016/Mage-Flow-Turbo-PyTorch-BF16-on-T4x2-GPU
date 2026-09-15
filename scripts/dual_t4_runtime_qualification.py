@@ -889,3 +889,302 @@ def adjudicate_post_head_device(
             violations.append({"from": frm, "to": to})
     exact_count = len(events) == expected
     ok = bool(events) and exact_count and not violations
+    return {
+        "pass": ok,
+        "event_count": len(events),
+        "expected_count": expected,
+        "exact_count": exact_count,
+        "expected_device": str(expected_device),
+        "observed_from_devices": from_devices,
+        "violation_count": len(violations),
+        "violations": violations,
+    }
+
+
+def _gate_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().upper() == "PASS"
+
+
+def derive_p0_g0_summary(
+    p0_status: Any,
+    g0_hardware_status: Any,
+    g0_session_status: Any,
+) -> Dict[str, str]:
+    """Combine the separate P0 / G0 sub-gates without aliasing P0 to G0."""
+    p0 = _gate_bool(p0_status)
+    hw = _gate_bool(g0_hardware_status)
+    sess = _gate_bool(g0_session_status)
+    return {
+        "p0_status": "PASS" if p0 else "FAIL",
+        "g0_hardware_status": "PASS" if hw else "FAIL",
+        "g0_session_status": "PASS" if sess else "FAIL",
+        "g0_status": "PASS" if (hw and sess) else "FAIL",
+    }
+
+
+def build_output_acceptance(
+    image_valid: bool,
+    no_nan: bool,
+    no_inf: bool,
+    path_exists: bool,
+) -> Dict[str, Any]:
+    """Combined ROUTING output gate: file present + valid image + no NaN + no Inf."""
+    return {
+        "path_exists": bool(path_exists),
+        "image_valid": bool(image_valid),
+        "no_nan": bool(no_nan),
+        "no_inf": bool(no_inf),
+        "valid": bool(path_exists and image_valid and no_nan and no_inf),
+    }
+
+
+def persist_live_block_count(summary: Dict[str, Any], blocks_live: Any) -> Dict[str, Any]:
+    """Persist ``num_blocks`` from the LIVE discovered block count."""
+    if isinstance(blocks_live, int):
+        n = max(int(blocks_live), 0)
+    else:
+        n = len(blocks_live) if blocks_live is not None else 0
+    summary["num_blocks"] = n
+    return summary
+
+
+def human_fact(s: Dict[str, Any], key: str) -> str:
+    """Same-named fact rendering: PASS only when the key is exactly True."""
+    return "PASS" if s.get(key) is True else "FAIL"
+
+
+def _human_passthrough(s: Dict[str, Any], key: str) -> str:
+    """Same-named fact rendering for string/bool gate statuses."""
+    value = s.get(key)
+    if value is True or str(value).strip().upper() == "PASS":
+        return "PASS"
+    return "FAIL"
+
+
+def human_g3_g6(s: Dict[str, Any]) -> str:
+    """Machine-derived G3/G6 execution fact (never a hard-coded literal).
+
+    ``NO`` only when the observed machine fact is explicitly False; absent
+    evidence renders ``UNPROVEN`` so the human line is never PASS-liegraded.
+    """
+    if s.get("g3_g6_executed") is False:
+        return "NO"
+    if s.get("g3_g6_executed") is True:
+        return "YES"
+    return "UNPROVEN"
+
+
+def summary_provenance_map() -> Dict[str, Dict[str, str]]:
+    """provenance summary provenance: every authority line maps to its OWN machine fact.
+
+    Authority entries use ``default_if_missing`` FAIL: missing evidence is
+    NEVER reported PASS.  Informational entries are classified explicitly with
+    ``kind=informational``.  Coverage is exact: the map keys equal every line
+    emitted by ``_print_human_summary``.
+    """
+    authority = {
+        "BOOTSTRAP_REQUIREMENTS_LOCK": {
+            "source": "bootstrap_requirements_sha256",
+            "evidence": "pinned bootstrap requirements-lock authority (sha256 present)",
+        },
+        "BOOTSTRAP_WHEELHOUSE_INTEGRITY": {
+            "source": "bootstrap_wheelhouse_artifacts",
+            "evidence": "local offline wheelhouse verified against hashed manifest",
+        },
+        "BOOTSTRAP_DEP_PREFLIGHT": {
+            "source": "bootstrap_dependency_preflight_gate",
+            "evidence": "installed bootstrap dependency states classified fail-closed",
+        },
+        "BOOTSTRAP_DEP_PROVISIONING": {
+            "source": "bootstrap_dependency_provisioning_gate",
+            "evidence": "offline local provisioning result (PASS / NOT_NEEDED)",
+        },
+        "BOOTSTRAP_DEP_POSTVERIFY": {
+            "source": "bootstrap_dependency_states_after.status",
+            "evidence": "post-provision exact-version + import verification",
+        },
+        "UPSTREAM_BOOTSTRAP": {
+            "source": "upstream_bootstrap.source_root",
+            "evidence": "pinned upstream source-root authority",
+        },
+        "P0": {
+            "source": "p0_status",
+            "evidence": "P0 fresh-kernel preflight gate",
+        },
+        "G0": {
+            "source": "g0_status",
+            "evidence": "combined G0 (hardware + session) status",
+        },
+        "L0": {
+            "source": "l0_status",
+            "evidence": "dual-T4 spread load acceptance",
+        },
+        "SDPA": {
+            "source": "sdpa.status",
+            "evidence": "frozen SDPA env gate (optimal path)",
+        },
+        "G1_PREREQUISITE": {
+            "source": "g1_status",
+            "evidence": "G1 routing-authority inference status",
+        },
+        "ROUTING": {
+            "source": "routing_status",
+            "evidence": "ROUTING routing authority inference status",
+        },
+        "RUNTIME_STATE_ID_STABLE": {
+            "source": "runtime_state_id_stable",
+            "evidence": "runtime state id did not change across inference",
+        },
+        "TRANSFORMER_ID_STABLE": {
+            "source": "transformer_id_stable",
+            "evidence": "transformer id did not change across inference",
+        },
+        "TEXT_ENCODER_ID_STABLE": {
+            "source": "text_encoder_id_stable",
+            "evidence": "text-encoder id did not change across inference",
+        },
+        "VAE_ID_STABLE": {
+            "source": "vae_id_stable",
+            "evidence": "vae id did not change across inference",
+        },
+        "EXACT_BLOCK_COVERAGE": {
+            "source": "routing_block_order_valid",
+            "evidence": "exact ROUTING block coverage (gate passes block order)",
+        },
+        "BLOCK_ORDER": {
+            "source": "routing_block_order_valid",
+            "evidence": "ROUTING observed block order equals planned order",
+        },
+        "NO_SKIP": {
+            "source": "routing_no_skipped_blocks",
+            "evidence": "no ROUTING block index skipped",
+        },
+        "NO_DUPLICATE_WITHIN_INVOCATION": {
+            "source": "routing_no_duplicated_blocks",
+            "evidence": "no ROUTING block index duplicated within invocation",
+        },
+        "GPU0_PARTICIPATION": {
+            "source": "routing_gpu0_participation",
+            "evidence": "ROUTING observed cuda:0 participation",
+        },
+        "GPU1_PARTICIPATION": {
+            "source": "routing_gpu1_participation",
+            "evidence": "ROUTING observed cuda:1 participation",
+        },
+        "TRANSFER_0_TO_1": {
+            "source": "routing_transfer_0_to_1_valid",
+            "evidence": "scoped cross_device_transfer events adjudicated by split-boundary cardinality",
+        },
+        "TRANSFORMER_RETURN_1_TO_0": {
+            "source": "routing_transformer_return_valid",
+            "evidence": "scoped transformer_output_return_transfer events by count+endpoints",
+        },
+        "POST_HEAD_DEVICE": {
+            "source": "post_head_device_valid",
+            "evidence": "expected post/head cross-check + audited return witness",
+        },
+        "VAE_INPUT_TRANSFER": {
+            "source": "routing_vae_input_transfer_valid",
+            "evidence": "scoped vae input transfer events by count+endpoints",
+        },
+        "CPU_FALLBACK_FORBIDDEN_CONFIG": {
+            "source": "cpu_fallback_forbidden_config",
+            "evidence": "authority configuration forbids CPU fallback (derived from RunContract)",
+        },
+        "NO_CPU_FALLBACK_OBSERVED": {
+            "source": "no_cpu_fallback_observed",
+            "evidence": "live placement + observed placement-validation + scoped telemetry",
+        },
+        "NO_NAN": {
+            "source": "routing_no_nan",
+            "evidence": "observed_facts NO_NAN of the ROUTING phase",
+        },
+        "NO_INF": {
+            "source": "routing_no_inf",
+            "evidence": "observed_facts NO_INF of the ROUTING phase",
+        },
+        "OUTPUT_VALID": {
+            "source": "routing_output_valid",
+            "evidence": "combined output gate (path + image + no-NaN + no-Inf)",
+        },
+        "G3_G6_EXECUTED": {
+            "source": "g3_g6_executed",
+            "evidence": "machine fact whether the G3/G6 future phase has executed",
+        },
+        "FINAL_VERDICT": {
+            "source": "status.routing_status",
+            "evidence": "final combined verdict (driver status + ROUTING status)",
+        },
+    }
+    informational = {
+        "SESSION_ID": {
+            "source": "session_id",
+            "evidence": "fresh session identifier",
+        },
+        "SESSION_STATE": {
+            "source": "session_state",
+            "evidence": "session state name",
+        },
+        "EVIDENCE_ROOT": {
+            "source": "evidence_root",
+            "evidence": "static evidence root path",
+        },
+        "MODEL_LOAD_COUNT": {
+            "source": "model_load_count",
+            "evidence": "model load count observed by the fresh session",
+        },
+        "SPLIT_BLOCK": {
+            "source": "split_block",
+            "evidence": "split-block K from the L0 memory plan",
+        },
+        "NUM_BLOCKS": {
+            "source": "num_blocks",
+            "evidence": "live discovered transformer block count",
+        },
+        "G1_INFERENCE_ID": {
+            "source": "g1_inference_id",
+            "evidence": "G1 inference identifier",
+        },
+        "ROUTING_INFERENCE_ID": {
+            "source": "routing_inference_id",
+            "evidence": "ROUTING inference identifier",
+        },
+        "EXPECTED_TRANSFORMER_INVOCATIONS": {
+            "source": "expected_transformer_invocations",
+            "evidence": "expected ROUTING transformer invocation cardinality",
+        },
+        "TRANSFER_0_TO_1_COUNT": {
+            "source": "routing_transfer_0_to_1_event_count/routing_transfer_0_to_1_expected_count",
+            "evidence": "observed vs expected cuda0->cuda1 transfer count",
+        },
+        "TRANSFORMER_RETURN_1_TO_0_COUNT": {
+            "source": "routing_transformer_return_event_count/routing_transformer_return_expected_count",
+            "evidence": "observed vs expected transformer output return count",
+        },
+        "POST_HEAD_DEVICE_EXPECTED": {
+            "source": "post_head_device_expected",
+            "evidence": "expected post/head device from split-boundary authority",
+        },
+        "POST_HEAD_DEVICE_OBSERVED": {
+            "source": "post_head_device_observed",
+            "evidence": "observed post/head device from scoped return telemetry",
+        },
+        "VAE_INPUT_TRANSFER_COUNT": {
+            "source": "routing_vae_input_transfer_event_count/routing_vae_input_transfer_expected_count",
+            "evidence": "observed vs expected vae input transfer count",
+        },
+    }
+    entries: Dict[str, Dict[str, str]] = {}
+    for label, entry in authority.items():
+        entry["kind"] = "authority"
+        entry["default_if_missing"] = "FAIL"
+        entries[label] = entry
+    for label, entry in informational.items():
+        entry["kind"] = "informational"
+        entries[label] = entry
+    return entries
+
+
+# ---------------------------------------------------------------------------
