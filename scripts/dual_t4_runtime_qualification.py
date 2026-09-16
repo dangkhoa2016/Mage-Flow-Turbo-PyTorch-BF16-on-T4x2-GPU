@@ -1466,3 +1466,302 @@ class DualT4QualificationDriver:
 
     def collect_failure_evidence(self, exc: Exception) -> None:
         """Preserve rich machine-readable evidence on EVERY failure."""
+        try:
+            s = self.summary
+            s["status"] = "FAIL"
+            s["exception_type"] = type(exc).__name__
+            s["exception_message"] = str(exc)
+            if isinstance(exc, AuthorityGateFailure):
+                s["first_failed_gate"] = exc.gate
+                s["failure_code"] = s.get("failure_code") or "AUTHORITY_GATE_FAILED"
+            else:
+                if not s.get("first_failed_gate"):
+                    s["first_failed_gate"] = "UNKNOWN"
+                s["failure_code"] = s.get("failure_code") or "UNHANDLED"
+            if not s.get("error"):
+                s["error"] = str(exc)
+
+            session = self.session
+            s["session_id"] = getattr(session, "session_id", None)
+            s["session_state"] = getattr(session, "state_name", None)
+            s["model_load_count"] = getattr(session, "model_load_count", None)
+            state = session.state if session is not None else None
+            s["runtime_state_id"] = id(state) if state is not None else None
+            s["transformer_id"] = (
+                id(getattr(state, "transformer", None))
+                if state is not None and getattr(state, "transformer", None) is not None
+                else None
+            )
+            s["text_encoder_id"] = (
+                id(getattr(state, "text_encoder", None))
+                if state is not None and getattr(state, "text_encoder", None) is not None
+                else None
+            )
+            s["vae_id"] = (
+                id(getattr(state, "vae", None))
+                if state is not None and getattr(state, "vae", None) is not None
+                else None
+            )
+
+            for phase in ("G1", "ROUTING"):
+                ev = self._existing_phase_evidence(phase)
+                id_k, op_k, ep_k, st_k = {
+                    "G1": ("g1_inference_id", "g1_output_path", "g1_evidence_paths", "g1_status"),
+                    "ROUTING": ("routing_inference_id", "routing_output_path", "routing_evidence_paths", "routing_status"),
+                }[phase]
+                for key, ev_key in ((id_k, "inference_id"), (op_k, "output_path"), (ep_k, "evidence_paths"), (st_k, "status")):
+                    if ev.get(ev_key) is not None and s.get(key) is None:
+                        s[key] = ev[ev_key]
+                if s.get(ep_k) is None:
+                    s[ep_k] = ev.get("evidence_paths") or {}
+        except Exception:
+            pass
+
+    def run(self) -> Dict[str, Any]:
+        # === qualified gate order (runbook section 57) ===
+        # 1) qualified runtime baseline integrity: FIRST gate, before anything else.
+        baseline = verify_runtime_baseline(REPO)
+        self.summary["RUNTIME_BASELINE_INTEGRITY"] = baseline["status"]
+        self.summary["RUNTIME_BASELINE_SHA256"] = baseline.get("manifest_sha256")
+        self.summary["RUNTIME_BASELINE_MANIFEST_ROWS"] = len(baseline.get("entries", []))
+        self.summary["RUNTIME_BASELINE_CANDIDATE_FILES"] = sorted(
+            e.get("path") for e in baseline.get("entries", [])
+        )
+        self.require(
+            "RUNTIME_BASELINE_INTEGRITY",
+            baseline["status"] == "PASS",
+            str(baseline.get("errors") or "runtime baseline not self-consistent"),
+        )
+        print(
+            "RUNTIME_BASELINE_INTEGRITY=PASS rows=%s sha256=%s"
+            % (len(baseline.get("entries", [])), baseline.get("manifest_sha256"))
+        )
+
+        # 2) Freeze the SDPA attention backend AFTER the baseline gate, BEFORE
+        #    the local bootstrap activation and any upstream mage_flow import.
+        freeze_sdpa_env()
+
+        # 3) Clean local bootstrap from a fresh site (offline, exact lock).
+        #    prepare_bootstrap_environment creates a fresh local target,
+        #    installs the exact bootstrap lock from the local wheelhouse into
+        #    it, activates it, and returns all four local bootstrap gates plus
+        #    the lock/wheelhouse integrity authoritative digests.
+        try:
+            bootstrap_env = prepare_bootstrap_environment(
+                project_root=REPO,
+            )
+        except BootstrapEnvironmentError as exc:
+            self.require("BOOTSTRAP_LOCAL_SITE_FRESH", False, str(exc))
+            raise
+        self.summary["bootstrap_site"] = bootstrap_env.get("target")
+        self.summary["bootstrap_pins"] = bootstrap_env.get("pins")
+        self.summary["bootstrap_requirements_sha256"] = bootstrap_env.get("lock_sha256")
+        self.summary["bootstrap_wheelhouse_manifest_sha256"] = bootstrap_env.get("manifest_sha256")
+        self.summary["BOOTSTRAP_REQUIREMENTS_LOCK"] = bootstrap_env.get("BOOTSTRAP_REQUIREMENTS_LOCK", "FAIL")
+        self.summary["BOOTSTRAP_WHEELHOUSE_INTEGRITY"] = bootstrap_env.get("BOOTSTRAP_WHEELHOUSE_INTEGRITY", "FAIL")
+        for gate, detail in (
+            ("BOOTSTRAP_LOCAL_SITE_FRESH", "fresh local bootstrap target created"),
+            ("BOOTSTRAP_LOCAL_PROVISION", "offline install of exact bootstrap lock"),
+            ("BOOTSTRAP_LOCAL_VERSION_VERIFY", "post-provision exact-version verify"),
+            ("BOOTSTRAP_LOCAL_ORIGIN_VERIFY", "bootstrap dependency local-origin verify"),
+        ):
+            value = bootstrap_env.get(gate, "FAIL")
+            self.summary[gate] = value
+            self.require(gate, value == "PASS", detail)
+        self.require("BOOTSTRAP_REQUIREMENTS_LOCK", self.summary["BOOTSTRAP_REQUIREMENTS_LOCK"] == "PASS", str(bootstrap_env.get("pins")))
+        self.require("BOOTSTRAP_WHEELHOUSE_INTEGRITY", self.summary["BOOTSTRAP_WHEELHOUSE_INTEGRITY"] == "PASS", "wheelhouse manifest/wheels unverified")
+        print(
+            "BOOTSTRAP_ENVIRONMENT=PASS site=%s lock_sha256=%s manifest_sha256=%s wheel_sha256=%s"
+            % (
+                bootstrap_env.get("target"),
+                bootstrap_env.get("lock_sha256"),
+                bootstrap_env.get("manifest_sha256"),
+                bootstrap_env.get("wheel_sha256"),
+            )
+        )
+
+        # --- R3 pinned upstream source bootstrap -----------------------------
+        try:
+            upstream = bootstrap_upstream_mage()
+        except UpstreamMageBootstrapError as exc:
+            self.require("UPSTREAM_BOOTSTRAP", False, f"{exc.failure_code}: {exc}")
+            raise
+        self.summary["upstream_bootstrap"] = {
+            "source_root": upstream.source_root,
+            "package_file": upstream.package_file,
+            "upstream_repository": upstream.upstream_repository,
+            "upstream_commit": upstream.upstream_commit,
+            "package_version": upstream.package_version,
+        }
+        self.require("UPSTREAM_BOOTSTRAP", True, "pinned vendor mage_flow bootstrapped")
+        print("UPSTREAM_BOOTSTRAP=PASS source=%s version=%s" % (
+            upstream.source_root, upstream.package_version,
+        ))
+
+        import torch
+
+        # --- P0 import/root gate -------------------------------------------
+        p0_ok = all(
+            (
+                REPO.is_dir(),
+                VaeInputBridge is not None,
+                DualDeviceForwardAdapter is not None,
+                callable(attach_dual_adapter),
+                callable(gpu_session.attach_dual_adapter),
+                callable(gpu_session.detach_dual_adapter),
+            )
+        )
+        self.summary["p0_status"] = "PASS" if p0_ok else "FAIL"
+        self.require("P0_FRESH_KERNEL_PREFLIGHT", p0_ok, "corrective modules/imports missing")
+        print("P0_OK repo=%s" % REPO)
+
+        # --- G0 hardware preflight -----------------------------------------
+        inv0 = []
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                major, minor = torch.cuda.get_device_capability(i)
+                inv0.append(
+                    {
+                        "index": i,
+                        "name": torch.cuda.get_device_name(i),
+                        "total_vram_bytes": int(props.total_memory),
+                        "compute_capability": f"{major}.{minor}",
+                    }
+                )
+        self.summary["gpu_inventory"] = inv0
+        hw_ok = (
+            bool(torch.cuda.is_available())
+            and int(torch.cuda.device_count()) == 2
+            and all("T4" in str(d.get("name", "")) for d in inv0)
+            and all(str(d.get("compute_capability")) == "7.5" for d in inv0)
+        )
+        self.summary["g0_hardware_status"] = "PASS" if hw_ok else "FAIL"
+        self.require("G0_HARDWARE", hw_ok, "require two Tesla T4 (sm_75) devices")
+        print("G0_HARDWARE=OK inventory=%s" % json.dumps(inv0))
+
+        # --- Authority objects ----------------------------------------------
+        contract = default_run_contract()
+        source = pinned_source_authority()
+        _require(source.mage_commit_sha == PINNED_MAGE_SHA, "SOURCE_PIN", "mage SHA mismatch")
+        _require(source.model_revision == PINNED_MODEL_REVISION, "SOURCE_PIN", "model revision mismatch")
+        expected_transformer_invocations = int(getattr(contract, "steps", 0))
+        self.summary["expected_transformer_invocations"] = expected_transformer_invocations
+        if expected_transformer_invocations <= 0:
+            self.require("CONTRACT_STEPS", False, "contract.steps must be positive")
+        self.require("CONTRACT_STEPS", True, "contract.steps positive")
+
+        # --- config provenance (qualification sec 7): derived, NEVER literal True ------
+        cfc = derive_cpu_fallback_config(contract)
+        self.summary["cpu_fallback_config_observed_value"] = cfc["cpu_fallback_config_observed_value"]
+        self.summary["cpu_fallback_forbidden_config"] = cfc["cpu_fallback_forbidden_config"]
+        self.require(
+            "CPU_FALLBACK_FORBIDDEN_CONFIG",
+            bool(cfc["cpu_fallback_forbidden_config"]),
+            "contract does not forbid CPU fallback",
+        )
+
+        evidence_root = self.evidence_root
+        session = StageBSession(
+            contract=contract,
+            source_authority=source.to_dict(),
+            evidence_root=str(evidence_root),
+        )
+        self.session = session
+        self.summary["session_id"] = session.session_id
+        self.summary["session_state"] = session.state_name
+        self.summary["mage_commit"] = source.mage_commit_sha
+        self.summary["model_id"] = source.model_identifier
+        self.summary["model_revision"] = source.model_revision
+        _require(
+            session.model_load_count == 0 and session.state is None,
+            "FRESH_SESSION",
+            "session must be fresh",
+        )
+        print("SESSION_OK id=%s evidence=%s" % (session.session_id, evidence_root))
+
+        # --- G0 via the session (project authority) -------------------------
+        g0 = session.run_g0_preflight()
+        self.summary["g0_session_status"] = g0.status
+        self.summary["g0_inventory"] = (g0.details or {}).get("inventory")
+        self.require("G0_SESSION", g0.status == "PASS", "G0 session preflight failed")
+        combined_g0 = derive_p0_g0_summary(
+            self.summary["p0_status"],
+            self.summary["g0_hardware_status"],
+            self.summary["g0_session_status"],
+        )
+        self.summary["g0_status"] = combined_g0["g0_status"]
+        self.require(
+            "G0",
+            combined_g0["g0_status"] == "PASS",
+            "G0 (hardware + session) not PASS",
+        )
+        print("G0_SESSION=PASS")
+
+        # --- Local model path (authority prefers the Kaggle attachment) -----
+        slug = contract.model.split("/")[-1]
+        candidates = [
+            EXPECTED_LOCAL_MODEL,
+            f"/kaggle/input/{slug}/pytorch/default/1",
+            f"/kaggle/input/{slug}",
+        ]
+        resolver = ModelPathResolver(candidates=candidates, required_rel_files=REQUIRED_MODEL_FILES)
+        resolution = resolver.resolve(fallback_id=None)
+        model_path = resolution["selected_path"]
+        source_kind = resolution["model_source"]
+        self.summary["model_path"] = model_path
+        self.require(
+            "MODEL_PATH",
+            bool(model_path) and source_kind == "LOCAL_ATTACHMENT",
+            f"local Kaggle model required; got {source_kind}",
+        )
+
+        # --- L0 dual-T4 spread load (exactly once) --------------------------
+        state = session.load_once(model_path)
+        l0 = session.results.get("L0")
+        memory_plan = getattr(state, "memory_plan", None) or {}
+        placement = getattr(state, "placement_validation", None) or {}
+        l0_facts = (l0.observed_facts if l0 is not None else {}) or {}
+
+        self.summary["model_load_count"] = session.model_load_count
+        self.summary["session_state"] = session.state_name
+        self.summary["runtime_state_id"] = id(state)
+        self.summary["transformer_id"] = id(state.transformer)
+        self.summary["text_encoder_id"] = id(state.text_encoder)
+        self.summary["vae_id"] = id(state.vae)
+        self.summary["memory_plan"] = memory_plan
+        self.summary["split_block"] = memory_plan.get("split_block")
+        self.summary["l0_status"] = l0.status if l0 is not None else "NOT_RUN"
+
+        blocks_live, _block_attr = discover_transformer_blocks(state.transformer)
+        persist_live_block_count(self.summary, blocks_live)
+        num_blocks_live = int(self.summary["num_blocks"])
+        plan_blocks = {
+            int(k): str(v)
+            for k, v in (memory_plan.get("block_devices") or {}).items()
+        }
+
+        # Live-derived authority endpoints (never hard-coded, never reconstructed).
+        actual_vae_device = derive_vae_device(state.vae)
+        self.summary["vae_device_expected"] = actual_vae_device
+        split_block = memory_plan.get("split_block")
+        boundary = derive_split_boundary_endpoints(memory_plan.get("block_devices") or {}, split_block)
+        self.summary["cross_transfer_boundary_from_block"] = boundary["from_block"]
+        self.summary["cross_transfer_boundary_to_block"] = boundary["to_block"]
+        self.summary["cross_transfer_expected_from"] = boundary["expected_from"]
+        self.summary["cross_transfer_expected_to"] = boundary["expected_to"]
+        self.require(
+            "CROSS_TRANSFER_BOUNDARY",
+            boundary["validated"],
+            boundary["reason"] or "split-boundary not validated",
+        )
+        cross_from = boundary["expected_from"]
+        cross_to = boundary["expected_to"]
+
+        # Plan-fallback latent anchor / post-head expected for the G1
+        # prerequisite adjudication (live capture happens after ROUTING).
+        plan_latent = derive_latent_anchor_device({}, memory_plan)
+        latent_anchor_g1 = plan_latent["anchor_device"]
+        self.summary["latent_anchor_plan_fallback"] = plan_latent
+        plan_post = derive_post_head_device_expected(memory_plan, None)
+        post_head_expected_g1 = plan_post["expected"]
