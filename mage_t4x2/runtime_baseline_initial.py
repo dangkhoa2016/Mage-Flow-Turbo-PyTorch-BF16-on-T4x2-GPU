@@ -297,3 +297,96 @@ def runtime_candidate_match_snapshot(
 
     doc = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
     comparison: Dict[str, Any] = {}
+    changed: List[str] = []
+    for entry in doc.get("groups", {}).get("candidate_runtime_files", []):
+        rel = entry["path"]
+        target = root / rel
+        if not target.is_file():
+            comparison[rel] = {"status": "MISSING"}
+            changed.append(rel)
+            continue
+        current = _sha256(target)
+        if current == entry["sha256"]:
+            comparison[rel] = {"status": "UNCHANGED", "sha256": current}
+        else:
+            comparison[rel] = {
+                "status": "CHANGED",
+                "pre_initial_sha256": entry["sha256"],
+                "current_sha256": current,
+            }
+            changed.append(rel)
+    return {
+        "status": "MATCH" if not changed else "MISMATCH",
+        "snapshot_sha256": _sha256(Path(snapshot_path)),
+        "files_checked": len(comparison),
+        "changed": changed,
+        "comparison": comparison,
+    }
+
+
+# ---------------------------------------------------------------------------
+# source manifest builder (authority/initial-authority-source-manifest.json)
+# ---------------------------------------------------------------------------
+
+def build_initial_runtime_authority_source_manifest(
+    project_root: Optional[Path] = None,
+    notebook_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Generate authority/initial-authority-source-manifest.json after qualification.
+
+    Hashes/sizes for the runtime baseline manifest, bootstrap helper, provenance
+    bootstrap provenance modules, the initial driver, requirements lock, wheelhouse
+    manifest + wheels, upstream provenance JSON, runtime baseline files, and the
+    pristine initial notebook. Returns None-with-no-write if a required source file
+    is missing (closeout tooling reports the gap); otherwise writes and returns
+    the verification record.
+    """
+    root = _default_project_root(project_root)
+    required_sources = [
+        "authority/runtime-baseline-initial.json",
+        "mage_t4x2/bootstrap_environment.py",
+        "mage_t4x2/bootstrap_dependencies.py",
+        "mage_t4x2/upstream_bootstrap.py",
+        "scripts/dual_t4_runtime_qualification_initial.py",
+        "requirements-bootstrap.lock",
+        "vendor/bootstrap-wheelhouse-manifest.json",
+        "vendor/mage_upstream/UPSTREAM_SOURCE_PROVENANCE.json",
+    ]
+    if notebook_path:
+        required_sources.append(notebook_path)
+
+    missing = [r for r in required_sources if not (root / r).is_file()]
+    wheelhouse = root / "vendor" / "bootstrap-wheelhouse"
+    wheel_missing = not (wheelhouse.is_dir() and list(wheelhouse.glob("*.whl")))
+    if missing or wheel_missing:
+        return None
+
+    files: List[Dict[str, Any]] = []
+    for rel in required_sources:
+        p = root / rel
+        files.append({"path": rel, "size": p.stat().st_size, "sha256": _sha256(p)})
+    for w in sorted(wheelhouse.glob("*.whl")):
+        rel = w.relative_to(root).as_posix()
+        files.append({"path": rel, "size": w.stat().st_size, "sha256": _sha256(w)})
+    for entry in REQUIRED_RUNTIME_FILES:
+        p = root / entry["path"]
+        files.append(
+            {
+                "path": entry["path"],
+                "size": p.stat().st_size,
+                "sha256": _sha256(p),
+                "role": entry["role"],
+                "baseline": True,
+            }
+        )
+
+    doc = {
+        "schema_version": 1,
+        "manifest_name": "INITIAL_RUNTIME_AUTHORITY_SOURCE_MANIFEST",
+        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "files": files,
+    }
+    out = root / "authority" / "initial-authority-source-manifest.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    return {"status": "PASS", "manifest_path": str(out), "files": len(files)}
