@@ -2064,3 +2064,261 @@ class DualT4QualificationDriver:
         routing_telemetry = parse_telemetry(str(routing_telemetry_path))
 
         routing_blocked = _records_for(routing_telemetry, session.session_id, routing.inference_id, "block_forward")
+        routing_cross_events = _records_for(routing_telemetry, session.session_id, routing.inference_id, "cross_device_transfer")
+        routing_return_events = _records_for(routing_telemetry, session.session_id, routing.inference_id, "transformer_output_return_transfer")
+        routing_vae_events = _records_for(routing_telemetry, session.session_id, routing.inference_id, "vae_input_transfer")
+
+        # GPU participation
+        routing_gpu0 = any(str(e.get("device")) == "cuda:0" for e in routing_blocked)
+        routing_gpu1 = any(str(e.get("device")) == "cuda:1" for e in routing_blocked)
+        self.summary["routing_gpu0_participation"] = bool(routing_gpu0)
+        self.summary["routing_gpu1_participation"] = bool(routing_gpu1)
+        self.require("ROUTING_GPU0_PARTICIPATION", routing_gpu0, "ROUTING GPU0 absent")
+        self.require("ROUTING_GPU1_PARTICIPATION", routing_gpu1, "ROUTING GPU1 absent")
+
+        # Block routing (BLOCK_ROUTING gate; never feeds TRANSFER/POST_HEAD)
+        routing_observed_blocks: Dict[int, str] = {}
+        for ev in routing_blocked:
+            routing_observed_blocks[int(ev.get("block"))] = str(ev.get("device"))
+        routing_routing = adjudicate_block_routing(routing_observed_blocks, plan_blocks, num_blocks_live)
+        self.summary["routing_block_adjudication"] = routing_routing
+        self.require("ROUTING_BLOCK_ROUTING", routing_routing["pass"], "ROUTING block routing mismatch")
+
+        # Cross-device transfer 0->1 (split-boundary endpoints, strict count)
+        cross_adj = adjudicate_transfer_cardinality(
+            routing_cross_events,
+            from_device=cross_from,
+            to_device=cross_to,
+            expected_count=int(contract.steps),
+        )
+        self.summary["routing_transfer_0_to_1_event_count"] = cross_adj["event_count"]
+        self.summary["routing_transfer_0_to_1_expected_count"] = cross_adj["expected_count"]
+        self.summary["routing_transfer_0_to_1_valid"] = cross_adj["pass"]
+        self.require(
+            "ROUTING_TRANSFER_0_TO_1",
+            cross_adj["pass"],
+            "ROUTING cross_device_transfer cardinality invalid",
+        )
+
+        # Transformer return via post/head witness (strict cardinality)
+        return_adj = adjudicate_transfer_cardinality(
+            routing_return_events,
+            from_device=post_head_expected,
+            to_device=latent_anchor,
+            expected_count=int(contract.steps),
+        )
+        self.summary["routing_transformer_return_event_count"] = return_adj["event_count"]
+        self.summary["routing_transformer_return_expected_count"] = return_adj["expected_count"]
+        self.summary["routing_transformer_return_valid"] = return_adj["pass"]
+        self.require(
+            "ROUTING_TRANSFORMER_RETURN_1_TO_0",
+            return_adj["pass"],
+            "ROUTING transformer return transfer invalid",
+        )
+
+        # Post/head device proof (expected cross-check + audited witness)
+        post_head_adj = adjudicate_post_head_device(
+            routing_return_events,
+            expected_device=post_head_expected,
+            expected_count=int(contract.steps),
+            anchor_device=latent_anchor,
+        )
+        observed_form = (
+            post_head_expected
+            if post_head_adj["pass"]
+            else "MISMATCH(%s)"
+            % ("|".join(post_head_adj["observed_from_devices"]) or "NO_RETURN_EVENTS")
+        )
+        self.summary["post_head_device_observed"] = observed_form
+        self.summary["post_head_device_valid"] = post_head_adj["pass"]
+        self.require(
+            "ROUTING_POST_HEAD_DEVICE",
+            post_head_adj["pass"],
+            "ROUTING post/head device witness invalid",
+        )
+
+        # VAE input transfer (strict cardinality == 1)
+        vae_adj = adjudicate_transfer_cardinality(
+            routing_vae_events,
+            from_device=latent_anchor,
+            to_device=actual_vae_device,
+            expected_count=1,
+        )
+        self.summary["routing_vae_input_transfer_event_count"] = vae_adj["event_count"]
+        self.summary["routing_vae_input_transfer_expected_count"] = vae_adj["expected_count"]
+        self.summary["routing_vae_input_transfer_valid"] = vae_adj["pass"]
+        self.require(
+            "ROUTING_VAE_INPUT_TRANSFER",
+            vae_adj["pass"],
+            f"ROUTING VAE input transfer to {actual_vae_device} invalid",
+        )
+
+        # qualification sec 6: observed NO-CPU-FALLBACK over live + observed + telemetry
+        scoped_records: List[Dict[str, Any]] = []
+        for ev in routing_blocked:
+            scoped_records.append(ev)
+        scoped_records.extend(routing_cross_events)
+        scoped_records.extend(routing_return_events)
+        scoped_records.extend(routing_vae_events)
+        ncf = adjudicate_no_cpu_fallback(live_placements, pv_observed, scoped_records)
+        self.summary["no_cpu_fallback_observed"] = ncf["no_cpu_fallback_observed"]
+        self.summary["no_cpu_fallback_adjudication"] = ncf["no_cpu_fallback_adjudication"]
+        self.require(
+            "NO_CPU_FALLBACK_OBSERVED",
+            ncf["no_cpu_fallback_observed"],
+            "CPU fallback observed in live placement, observed validation, or telemetry",
+        )
+
+        # ROUTING phase block integrity (per-invocation multi-step)
+        routing_integrity = phase_block_integrity(routing.observed_facts)
+        self.summary["routing_block_order_valid"] = routing_integrity["block_order_valid"]
+        self.summary["routing_no_skipped_blocks"] = routing_integrity["no_skipped_blocks"]
+        self.summary["routing_no_duplicated_blocks"] = routing_integrity["no_duplicated_blocks"]
+        self.summary["routing_cross_inference_clean"] = routing_integrity["cross_inference_clean"]
+        self.summary["routing_block_integrity"] = routing_integrity
+        self.require("ROUTING_EXACT_BLOCK_COVERAGE", routing_integrity["block_order_valid"], "ROUTING block order invalid")
+        self.require("ROUTING_NO_SKIPPED_BLOCKS", routing_integrity["no_skipped_blocks"], "ROUTING skipped blocks")
+        self.require("ROUTING_NO_DUPLICATED_BLOCKS", routing_integrity["no_duplicated_blocks"], "ROUTING duplicated blocks")
+        self.require("ROUTING_CROSS_INFERENCE_CLEAN", routing_integrity["cross_inference_clean"], "ROUTING cross-inference contamination")
+        print("ROUTING_ROUTING=PASS")
+
+        # --- ROUTING output acceptance -------------------------------------------
+        routing_image = validate_image(routing.output_path)
+        routing_no_nan = bool((routing.observed_facts or {}).get("NO_NAN"))
+        routing_no_inf = bool((routing.observed_facts or {}).get("NO_INF"))
+        output_acceptance = build_output_acceptance(
+            image_valid=bool(routing_image.get("valid")),
+            no_nan=routing_no_nan,
+            no_inf=routing_no_inf,
+            path_exists=bool(routing.output_path and Path(routing.output_path).is_file()),
+        )
+        self.summary["routing_image_validation"] = routing_image
+        self.summary["routing_no_nan"] = routing_no_nan
+        self.summary["routing_no_inf"] = routing_no_inf
+        self.summary["routing_output_valid"] = output_acceptance["valid"]
+        self.require(
+            "ROUTING_OUTPUT_VALID",
+            bool(output_acceptance["valid"]),
+            f"ROUTING output invalid: {routing_image}",
+        )
+
+        # --- ROUTING phase acceptance (whole trajectory) ---------------------------
+        routing_acceptance_ok = (routing.acceptance or {}).get("status") == "PASS"
+        self.require("ROUTING_ACCEPTANCE", routing_acceptance_ok, "ROUTING phase acceptance not PASS")
+
+        # --- Final adjudication -----------------------------------------------
+        self.summary["status"] = "PASS"
+        self.summary["g3_g6_executed"] = False
+        session.save_status(str(Path(evidence_root) / "session-status.json"))
+        _write_summary_best_effort(self, self.summary, evidence_root)
+        _print_human_summary(self.summary)
+        print("FINAL_VERDICT=PASS")
+        return self.summary
+
+
+# ---------------------------------------------------------------------------
+# Summary output
+# ---------------------------------------------------------------------------
+
+
+def _print_human_summary(s: Dict[str, Any]) -> None:
+    def mark(ok: bool) -> str:
+        return "PASS" if ok else "FAIL"
+
+    routing_ok = s.get("status") == "PASS" and s.get("routing_status") == "PASS"
+    verdict = "PASS" if routing_ok else "FAIL"
+    print("=" * 60)
+    print("=== ROUTING ROUTING AUTHORITY qualified SUMMARY (historical/provenance-corrective preserved; multistep block-integrity corrective) ===")
+    print(f"SESSION_ID={s.get('session_id')}")
+    print(f"SESSION_STATE={s.get('session_state')}")
+    print(f"EVIDENCE_ROOT={s.get('evidence_root')}")
+    print(f"RUNTIME_BASELINE_INTEGRITY={_human_passthrough(s, 'RUNTIME_BASELINE_INTEGRITY')}")
+    print(f"BOOTSTRAP_REQUIREMENTS_LOCK={_human_passthrough(s, 'BOOTSTRAP_REQUIREMENTS_LOCK')}")
+    print(f"BOOTSTRAP_WHEELHOUSE_INTEGRITY={_human_passthrough(s, 'BOOTSTRAP_WHEELHOUSE_INTEGRITY')}")
+    print(f"BOOTSTRAP_LOCAL_SITE_FRESH={_human_passthrough(s, 'BOOTSTRAP_LOCAL_SITE_FRESH')}")
+    print(f"BOOTSTRAP_LOCAL_PROVISION={_human_passthrough(s, 'BOOTSTRAP_LOCAL_PROVISION')}")
+    print(f"BOOTSTRAP_LOCAL_VERSION_VERIFY={_human_passthrough(s, 'BOOTSTRAP_LOCAL_VERSION_VERIFY')}")
+    print(f"BOOTSTRAP_LOCAL_ORIGIN_VERIFY={_human_passthrough(s, 'BOOTSTRAP_LOCAL_ORIGIN_VERIFY')}")
+    print(f"UPSTREAM_BOOTSTRAP={mark((s.get('upstream_bootstrap') or {}).get('source_root') is not None)}")
+    print(f"P0={_human_passthrough(s, 'p0_status')}")
+    print(f"G0={mark(s.get('g0_status') == 'PASS')}")
+    print(f"L0={mark(s.get('l0_status') == 'PASS')}")
+    print(f"SDPA={mark((s.get('sdpa') or {}).get('status') == 'PASS')}")
+    print(f"MODEL_LOAD_COUNT={s.get('model_load_count')}")
+    print(f"SPLIT_BLOCK={s.get('split_block')}")
+    print(f"NUM_BLOCKS={s.get('num_blocks')}")
+    print(f"G1={mark(s.get('g1_status') == 'PASS')}")
+    print(f"G1_INFERENCE_ID={s.get('g1_inference_id')}")
+    print(f"ROUTING={mark(routing_ok)}")
+    print(f"ROUTING_INFERENCE_ID={s.get('routing_inference_id')}")
+    print(f"RUNTIME_STATE_ID_STABLE={human_fact(s, 'runtime_state_id_stable')}")
+    print(f"TRANSFORMER_ID_STABLE={human_fact(s, 'transformer_id_stable')}")
+    print(f"TEXT_ENCODER_ID_STABLE={human_fact(s, 'text_encoder_id_stable')}")
+    print(f"VAE_ID_STABLE={human_fact(s, 'vae_id_stable')}")
+    print(f"EXACT_BLOCK_COVERAGE={human_fact(s, 'routing_block_order_valid')}")
+    print(f"BLOCK_ORDER={human_fact(s, 'routing_block_order_valid')}")
+    print(f"NO_SKIP={human_fact(s, 'routing_no_skipped_blocks')}")
+    print(f"NO_DUPLICATE_WITHIN_INVOCATION={human_fact(s, 'routing_no_duplicated_blocks')}")
+    print(f"GPU0_PARTICIPATION={human_fact(s, 'routing_gpu0_participation')}")
+    print(f"GPU1_PARTICIPATION={human_fact(s, 'routing_gpu1_participation')}")
+    print(f"EXPECTED_TRANSFORMER_INVOCATIONS={s.get('expected_transformer_invocations')}")
+    print(f"TRANSFER_0_TO_1_COUNT={s.get('routing_transfer_0_to_1_event_count')}/{s.get('routing_transfer_0_to_1_expected_count')}")
+    print(f"TRANSFER_0_TO_1={human_fact(s, 'routing_transfer_0_to_1_valid')}")
+    print(f"TRANSFORMER_RETURN_1_TO_0_COUNT={s.get('routing_transformer_return_event_count')}/{s.get('routing_transformer_return_expected_count')}")
+    print(f"TRANSFORMER_RETURN_1_TO_0={human_fact(s, 'routing_transformer_return_valid')}")
+    print(f"POST_HEAD_DEVICE_EXPECTED={s.get('post_head_device_expected')}")
+    print(f"POST_HEAD_DEVICE_OBSERVED={s.get('post_head_device_observed')}")
+    print(f"POST_HEAD_DEVICE={human_fact(s, 'post_head_device_valid')}")
+    print(f"VAE_INPUT_TRANSFER_COUNT={s.get('routing_vae_input_transfer_event_count')}/{s.get('routing_vae_input_transfer_expected_count')}")
+    print(f"VAE_INPUT_TRANSFER={human_fact(s, 'routing_vae_input_transfer_valid')}")
+    print(f"CPU_FALLBACK_FORBIDDEN_CONFIG={human_fact(s, 'cpu_fallback_forbidden_config')}")
+    print(f"NO_CPU_FALLBACK_OBSERVED={human_fact(s, 'no_cpu_fallback_observed')}")
+    print(f"NO_NAN={human_fact(s, 'routing_no_nan')}")
+    print(f"NO_INF={human_fact(s, 'routing_no_inf')}")
+    print(f"OUTPUT_VALID={human_fact(s, 'routing_output_valid')}")
+    print(f"G3_G6_EXECUTED={human_g3_g6(s)}")
+    print(f"FINAL_VERDICT={verdict}")
+    print("=" * 60)
+
+
+def _write_summary_best_effort(
+    driver: DualT4QualificationDriver, summary: Dict[str, Any], evidence_root: Path
+) -> Optional[Path]:
+    summary_path = Path(evidence_root) / "corrective-summary.json"
+    summary["corrective_summary_path"] = str(summary_path)
+    try:
+        _write_json(summary_path, summary)
+        return summary_path
+    except Exception:
+        if summary.get("status") == "PASS":
+            raise
+        return None
+
+
+def _run_driver() -> int:
+    evidence_root = (
+        REPO
+        / "evidence"
+        / "gpu"
+        / ("routing-routing-authority-qualified-fresh-%s-%s" % (time.strftime("%Y%m%dT%H%M%SZ"), uuid.uuid4().hex[:8]))
+    )
+    driver = DualT4QualificationDriver(evidence_root)
+    summary = None
+    try:
+        summary = driver.run()
+    except AuthorityGateFailure as exc:
+        driver.collect_failure_evidence(exc)
+    except Exception as exc:
+        driver.collect_failure_evidence(exc)
+    if summary is None:
+        summary = driver.summary
+    _write_summary_best_effort(driver, summary, evidence_root)
+    _print_human_summary(summary)
+    if summary.get("status") != "PASS":
+        print(f"FINAL_VERDICT=FAIL first_failed_gate={summary.get('first_failed_gate')}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_run_driver())
