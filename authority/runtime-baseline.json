@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "baseline_name": "QUALIFIED_RUNTIME_BASELINE",
+  "status": "QUALIFIED_STATIC",
+  "created_utc": "2026-09-18T08:41:50Z",
+  "reason": "new qualified corrective baseline for the successor source that refuses the genuine G1 multistep block-integrity false negative (global block-order derivation replaced by per-invocation multi-step segmentation); not byte-equivalent to the initial/intermediate/hardened baselines because reducer/acceptance were corrected",
+  "behavior_qualification": {
+    "status": "QUALIFIED",
+    "duration_ms": null,
+    "tests_passed": null,
+    "checks": null,
+    "reason": "TDDRED->GREEN->focused->full->compileall->sourcefreeze->protected->replay all PASS"
+  },
+  "files": [
+    {
+      "path": "mage_t4x2/dual_device_forward.py",
+      "size": 24592,
+      "sha256": "3ba5d55a425d027e7b99c0107d25058d45cf7480781fe376792450644dc9d471",
+      "role": "transformer cross-device and return bridge"
+    },
+    {
+      "path": "mage_t4x2/device_bridges.py",
+      "size": 6383,
+      "sha256": "b3f2e354e38e085bbc6296a75d8174ae6c2d6b0d27b3fd9d317c6ab571dd154b",
+      "role": "VAE input bridge; caller/latent anchor"
+    },
+    {
+      "path": "scripts/gpu_session.py",
+      "size": 22993,
+      "sha256": "5e987ce31fda1a0673f98048408de983f21d02c3e95dbb265c3cb85b9724ce7d",
+      "role": "runtime session orchestration; load-once; cross-device config"
+    },
+    {
+      "path": "mage_t4x2/evidence_reducers.py",
+      "size": 11271,
+      "sha256": "1782a7de724b2a907798ef4eb28c96009ef920f5e936a80b89b2fb6be835c421",
+      "role": "GPU participation / transfer / block-integrity reducers"
+    },
+    {
+      "path": "mage_t4x2/phase_acceptance.py",
+      "size": 15543,
+      "sha256": "5aef2573a1ff4774fd623ef1b7c6b08fce5dee1b5213a328f46fd0f673998d80",
+      "role": "per-phase acceptance facts derived from evidence"
+    },
+    {
+      "path": "mage_t4x2/stage_b_session.py",
+      "size": 40645,
+      "sha256": "95e86a8df707aa5811958cd46d62b4445c5c32cfeaab8d406c1dea077836c3bc",
+      "role": "session state machine; load_once; G1/ROUTING runners"
+    },
+    {
+      "path": "mage_t4x2/upstream_bootstrap.py",
+      "size": 12504,
+      "sha256": "62dd52ae5421259f6adf52bffa228f37cb8376334996ff909969767abefb7762",
+      "role": "vendored mage_flow bootstrap provenance"
+    },
+    {
+      "path": "mage_t4x2/sdpa_contract.py",
+      "size": 10879,
+      "sha256": "4813f57231feaf71dd7ead3a683dbba6ce8ccd3aa558b4cb82bc05713f7d4a97",
+      "role": "SDPA freeze env/backend"
+    },
+    {
+      "path": "mage_t4x2/constants.py",
+      "size": 2181,
+      "sha256": "d3f6b9f0b4873ab4d44ce5c000238e5180e79c233d2c2af2fe573f4a238cb3cb",
+      "role": "frozen project constants (devices, blocks, pins)"
+    },
+    {
+      "path": "mage_t4x2/contracts.py",
+      "size": 5022,
+      "sha256": "028f493fa91325fc5d43a5024af3cbd604a6940003da0aac6a27ed31e1ab9efa",
+      "role": "run contract model"
+    },
+    {
+      "path": "mage_t4x2/bootstrap_dependencies.py",
+      "size": 22684,
+      "sha256": "a015f10f46d2a111d29ba82c15d9e73839e7e86916f554e35627cf08f3894f13",
+      "role": "bootstrap dependency lock/wheelhouse provisioning"
+    },
+    {
+      "path": "mage_t4x2/block_partition.py",
+      "size": 3692,
+      "sha256": "0f27788b7f4a071846b5d58db663d427d8cb3ff83bafdc0072b7a62519df639d",
+      "role": "block discovery feeding adapter + session (block integrity / cross-device)"
+    },
+    {
+      "path": "mage_t4x2/device_plan.py",
+      "size": 8987,
+      "sha256": "b975a0b0714d18f5057ed50d643160419098e64a927412c7d268963fa0b7a48f",
+      "role": "build_device_plan (device placement)"
+    },
+    {
+      "path": "mage_t4x2/transformer_placement.py",
+      "size": 11617,
+      "sha256": "adf4d8c1a5b8c8787c2383adadeff69199675a2e3e838fed5b1a20cc735fbe8d",
+      "role": "pre/post block placement consistency (return placement)"
+    },
+    {
+      "path": "mage_t4x2/spread_loader.py",
+      "size": 17132,
+      "sha256": "8f9d994c53b73b105829c017be5328522970972a04fe3a2e7c1c18d86f6362c4",
+      "role": "L0 dual-T4 spread load (placement / load count)"
+    },
+    {
+      "path": "mage_t4x2/memory_plan.py",
+      "size": 12381,
+      "sha256": "37fff5988d059e2cede6ac6f7d0df52977768b864ce9df45143a7b9df4c04146",
+      "role": "split-block / memory plan derivation (split boundary / L0)"
+    },
+    {
+      "path": "mage_t4x2/telemetry.py",
+      "size": 3638,
+      "sha256": "d8569e0dfbb878b8aa1c4c8b30251b966fa9b93937af39ae69fca58cf99c141a",
+      "role": "telemetry recorder + parser (block-integrity evidence)"
+    },
+    {
+      "path": "mage_t4x2/evidence.py",
+      "size": 4925,
+      "sha256": "e51cad96193e63ec562cf545db16030c76bc4024c94f2e80a023b4fe885a8e4f",
+      "role": "EvidenceRun write paths"
+    },
+    {
+      "path": "mage_t4x2/dtype_audit.py",
+      "size": 8615,
+      "sha256": "543b0c3a58a0fdd055d3cd76137e7b72ab8c13a64cb8e9ee6943413414ca3271",
+      "role": "runtime dtype audit (acceptance)"
+    },
+    {
+      "path": "mage_t4x2/environment.py",
+      "size": 3206,
+      "sha256": "10a5198c8df94dea39365659609fb0f111af4db7b7e9ec6fca8ba4917feae7a2",
+      "role": "cuda inventory (G0 / device placement)"
+    },
+    {
+      "path": "mage_t4x2/model_provenance.py",
+      "size": 6294,
+      "sha256": "7004dca270ad71fa7d6923bddd115d37d508b787a4840f3ed2bdb2f641645489",
+      "role": "model identity / revision (bootstrap provenance)"
+    },
+    {
+      "path": "mage_t4x2/model_inventory.py",
+      "size": 7920,
+      "sha256": "243cdca550ff6ea7f03b78a4ae283551538287ff42eac9eb87294eb07a486962",
+      "role": "component inventory (model-load)"
+    },
+    {
+      "path": "mage_t4x2/image_validation.py",
+      "size": 2768,
+      "sha256": "a886aa1fed69e74c20fc5a7fd955af8fb0ff9a59d13532fa3b29c5bd251574b4",
+      "role": "output validation (acceptance)"
+    },
+    {
+      "path": "mage_t4x2/nvidia_bootstrap.py",
+      "size": 3844,
+      "sha256": "dd74fede28b67fcd2108fb075e67ea4b4ec35e0d4a5293a0fafe93c7bc891bcf",
+      "role": "NVIDIA libs preflight (G0)"
+    },
+    {
+      "path": "mage_t4x2/source_pin.py",
+      "size": 7491,
+      "sha256": "3ba28b3e678eb1d55e3ac5936ff90ca72b3e1d1188e55d1070ae0357ff40ae2e",
+      "role": "pinned source authority (upstream provenance)"
+    },
+    {
+      "path": "mage_t4x2/hashing.py",
+      "size": 1630,
+      "sha256": "06264fa84a50e73f35e0f04e8bb57ef45bbb1585d3e07d5b8e94c840c91d6c1d",
+      "role": "acceptance hashing (replay policy)"
+    },
+    {
+      "path": "mage_t4x2/dtype_policy.py",
+      "size": 5416,
+      "sha256": "854f250eee24a637b71dcaad39fccfab8cd1a79d81fb1a42e8e72f35330b277e",
+      "role": "dtype policy (acceptance)"
+    },
+    {
+      "path": "mage_t4x2/phase_backend.py",
+      "size": 22631,
+      "sha256": "6a0aa3ed299a04f8cfda91549dd5c666bae6c21ec7e3eb709f9196ecffb90a38",
+      "role": "synthetic phase backend parity (acceptance / session)"
+    },
+    {
+      "path": "mage_t4x2/runtime_baseline.py",
+      "size": 14301,
+      "sha256": "993505556fc78e9638d9dd62ebb55199f519c15978cb3c0d9555a1f718b9b2d5",
+      "role": "qualified runtime baseline manifest build + verify"
+    },
+    {
+      "path": "mage_t4x2/bootstrap_environment.py",
+      "size": 30612,
+      "sha256": "00f0e6b64f5a33ea3578a85d5184bf02e39c9520e735b50532f436762d9b898f",
+      "role": "hardened fail-closed clean bootstrap environment (Defects A+B corrected)"
+    },
+    {
+      "path": "scripts/dual_t4_runtime_qualification.py",
+      "size": 100187,
+      "sha256": "59d50ed7843c86e79c9c4b828054063f49619ab4d92d733c0567bd100b52deb4",
+      "role": "qualified multistep block-integrity corrective dual-T4 routing authority driver"
+    }
+  ],
+  "historical_reference": {
+    "note": "Earlier development baselines are superseded by this qualified runtime baseline."
+  }
+}
