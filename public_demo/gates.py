@@ -1,6 +1,20 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
+
+
+def derive_model_load_count(load_events: Sequence[Any]) -> int:
+    """Derive the model load count strictly from recorded load lifecycle events.
+
+    The loader wrapper owned by the run appends exactly one event per real load
+    call. The count is therefore run evidence, never a hard-coded assertion.
+    """
+    return len(load_events)
+
+
+def model_load_count_ok(count: int) -> bool:
+    """Canonical gate: exactly one model load, derived from run evidence."""
+    return count == 1
 
 
 def component_dtypes(dtype_after: Dict[str, Any]) -> Dict[str, str]:
