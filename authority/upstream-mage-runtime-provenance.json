@@ -1,0 +1,58 @@
+{
+  "package": "mage_flow",
+  "package_version": "0.1.0",
+  "runtime_files": {
+    "mage_flow/__init__.py": {
+      "git_blob_sha": "2893b216a01937bec31c6001cecb286212996eb5",
+      "sha256": "0709764f182b55fdec6b8195a4d18640fe0ffef3785d3977d8ebc29905de7489"
+    },
+    "mage_flow/models/__init__.py": {
+      "git_blob_sha": "6de1f5baf3234bf660218aef6a8d9a5e1f5620c0",
+      "sha256": "7e5ba07fdb01f4a5912eaeb3afbe9d4ccc4e391e7de4cdc11865e5aa911ddfd5"
+    },
+    "mage_flow/models/mage_flow.py": {
+      "git_blob_sha": "69dabe3de971c88bb7d9c75baf89e56b675cce2a",
+      "sha256": "59b6e1bee7f95a7fd2fa7bd9e765966832951e2bb184b5ae27283884997b845f"
+    },
+    "mage_flow/models/modules/__init__.py": {
+      "git_blob_sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "mage_flow/models/modules/_attn_backend.py": {
+      "git_blob_sha": "6469c4bb42af53f2cd58e61915cabafaa1dc502a",
+      "sha256": "7d652eeb2ab39e37554e3d62859c74edeffc8dce70b2c15687060c259647b559"
+    },
+    "mage_flow/models/modules/mage_latent.py": {
+      "git_blob_sha": "c119977db46691bc5609384c20a8a8ea4965177f",
+      "sha256": "9ffd7c68b6053ad37f6bf0925d8d94dcd72af751448ee0228ec13018fedf54e5"
+    },
+    "mage_flow/models/modules/mage_layers.py": {
+      "git_blob_sha": "167b399c17a4db217825a71a7d4ca49f196a35be",
+      "sha256": "4b198343b8929f48a0a14d388502c81f54be17b222f6831303d2da6a91f33a62"
+    },
+    "mage_flow/models/modules/mage_text.py": {
+      "git_blob_sha": "52552623b8b4c122fbc72f98df33daa2afb072b1",
+      "sha256": "f900314ef5f51d5bf719db170cad90f4b417555e55ef4ee8f9d9852555be4d68"
+    },
+    "mage_flow/models/modules/mage_vae.py": {
+      "git_blob_sha": "58c1b10bd30a59a959b4231d3966339343b58f90",
+      "sha256": "64f4d7041003e416bc2f4fac5bbf8aabf2e7c798ad106682c34332ba347b0ef9"
+    },
+    "mage_flow/models/modules/text_encoder.py": {
+      "git_blob_sha": "660cbcb609c7f456f75084aaff5e0dc8baf6743c",
+      "sha256": "65e490ce35fbe4d4057f115be2ab8731e01ea44b618c10aabac80d51fc38ef81"
+    },
+    "mage_flow/models/utils.py": {
+      "git_blob_sha": "30bb3a28334dff19b698f6c438881bae71aedd7f",
+      "sha256": "0f242ca7a77e0f85b5985b5299304aa0786737de1ba414c7f8f47b8d664dbca8"
+    },
+    "mage_flow/pipeline.py": {
+      "git_blob_sha": "3e5aaba5ac97bf1c06adbc8f637117ce3fe20ac6",
+      "sha256": "b9fc57018570372dd3404a733e19b918a359188dd9f5ef7817c6b30969fc13db"
+    }
+  },
+  "schema_version": 1,
+  "upstream_commit": "76bec2bb3818863f470de7e867c2dc7f1d0bfd83",
+  "upstream_mage_flow_tree": "946b91bcb2cac75e6cfe8399f0f7f330a2280adf",
+  "upstream_repository": "https://github.com/microsoft/Mage"
+}
