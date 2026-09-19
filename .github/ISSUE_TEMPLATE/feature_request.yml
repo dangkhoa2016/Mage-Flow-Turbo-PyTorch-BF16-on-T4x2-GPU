@@ -1,0 +1,43 @@
+name: Feature request / Đề xuất tính năng
+description: Propose a scoped improvement / Đề xuất cải tiến có phạm vi rõ ràng
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Problem or use case / Vấn đề hoặc use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change / Thay đổi đề xuất
+      description: Describe the smallest useful change. / Mô tả thay đổi hữu ích nhỏ nhất.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Primary scope / Phạm vi chính
+      options:
+        - Runtime / routing
+        - Public runner / bootstrap
+        - Kaggle notebook
+        - Evidence / authority
+        - CI / repository automation
+        - Documentation
+        - Other / Khác
+    validations:
+      required: true
+  - type: textarea
+    id: authority
+    attributes:
+      label: Authority impact / Tác động authority
+      description: Would this change qualified runtime bytes or GPU claims? / Thay đổi có ảnh hưởng qualified runtime bytes hoặc GPU claim không?
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Scope acknowledgement / Xác nhận phạm vi
+      options:
+        - label: I understand CPU/static validation does not replace real T4 x2 qualification. / Tôi hiểu CPU/static validation không thay thế real T4 x2 qualification.
+          required: true

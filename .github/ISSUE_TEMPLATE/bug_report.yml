@@ -1,0 +1,54 @@
+name: Bug report / Báo lỗi
+description: Report a reproducible defect / Báo cáo lỗi có thể tái hiện
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove secrets and private data from logs.
+        Hãy loại bỏ secret và dữ liệu riêng tư khỏi log.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem summary / Tóm tắt lỗi
+      description: What happened and what did you expect? / Điều gì đã xảy ra và bạn mong đợi điều gì?
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment / Môi trường
+      options:
+        - Kaggle Tesla T4 x2
+        - CPU/static local or CI
+        - Other / Khác
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Commit SHA or release / Commit SHA hoặc release
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps / Các bước tái hiện
+      description: Include notebook cell, CLI command, or minimal Python call. / Thêm notebook cell, CLI command hoặc Python call tối thiểu.
+    validations:
+      required: true
+  - type: textarea
+    id: gates
+    attributes:
+      label: First failed gate and logs / Gate lỗi đầu tiên và log
+      description: Redact credentials, tokens and private paths where necessary. / Xóa credential, token và private path khi cần.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks / Kiểm tra trước khi gửi
+      options:
+        - label: I searched existing issues. / Tôi đã tìm issue trùng lặp.
+          required: true
+        - label: This is not a security vulnerability. / Đây không phải lỗ hổng bảo mật.
+          required: true
