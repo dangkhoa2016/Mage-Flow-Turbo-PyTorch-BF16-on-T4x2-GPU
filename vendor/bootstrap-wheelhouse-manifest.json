@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "requirements_file": "requirements-bootstrap.lock",
+  "requirements_sha256": "55656924873422b512ac657066fb47029d0b27f979c906b6182c9c64def91ac3",
+  "python_target": "3.12",
+  "platform_tag": "any",
+  "wheel_count": 1,
+  "total_bytes": 61595,
+  "artifacts": [
+    {
+      "filename": "loguru-0.7.3-py3-none-any.whl",
+      "size": 61595,
+      "sha256": "31a33c10c8e1e10422bfd431aeb5d351c7cf7fa671e3c4df004162264b28220c",
+      "distribution": "loguru",
+      "version": "0.7.3"
+    }
+  ]
+}
