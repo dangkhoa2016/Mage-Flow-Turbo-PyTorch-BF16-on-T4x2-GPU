@@ -482,3 +482,190 @@ def block_execution_summary(events: List[Dict[str, Any]]) -> List[Tuple[int, str
 
 def transfer_summary(events: List[Dict[str, Any]]) -> List[Tuple[str, str, str]]:
     return [(str(e["from"]), str(e["to"]), str(e["block_boundary"])) for e in events]
+
+
+# ---------------------------------------------------------------------------
+# Minimal structural-mirror synthetic transformer for CPU qualification
+# ---------------------------------------------------------------------------
+
+
+class SyntheticTransformer:
+    """A tiny transformer with the SAME structural calling convention as the
+    upstream ``MageFlow``. Tensors are plain torch tensors on CPU; logical
+    devices are threaded through ``device_ctx`` so routing is provable without
+    CUDA."""
+
+    def __init__(self, depth: int = 24, dim: int = 8) -> None:
+        import torch.nn as nn
+
+        self.inner_dim = dim
+        self.checkpoint = False
+        self.device_ctx: Dict[str, str] = {}  # block index -> logical device
+        self.execution_order: List[int] = []
+        self.blocks_declared = depth
+
+        self.pos_embed = _SyntheticRoPE(dim)
+        self.img_in = nn.Linear(dim, dim)
+        self.txt_norm = nn.LayerNorm(dim)
+        self.txt_in = nn.Linear(dim, dim)
+        self.time_text_embed = _SyntheticTimeEmbed(dim)
+        self.transformer_blocks = [_SynthBlock(dim) for _ in range(depth)]
+        self.norm_out = _SyntheticAdaLN(dim)
+        self.proj_out = nn.Linear(dim, dim)
+        self._training = False
+
+    @property
+    def training(self) -> bool:
+        return self._training
+
+    def forward(
+        self,
+        img,
+        txt,
+        timesteps,
+        img_shapes=None,
+        img_cu_seqlens=None,
+        txt_cu_seqlens=None,
+        attention_kwargs=None,
+    ):
+        import torch
+
+        ms_pe = self.pos_embed(img_shapes, device=img.device)
+        img = self.img_in(img)
+        txt = self.txt_norm(txt)
+        timesteps = timesteps.to(img.dtype)
+        temb = self.time_text_embed(timesteps, img)
+        txt = self.txt_in(txt)
+        txt_vec = torch.zeros(txt.shape[0], self.inner_dim, dtype=txt.dtype, device=txt.device)
+        temb = temb + txt_vec
+        attention_kwargs = attention_kwargs or {}
+        for idx, block in enumerate(self.transformer_blocks):
+            self.execution_order.append(idx)
+            txt, img = block(
+                hidden_states=img,
+                encoder_hidden_states=txt,
+                txt_cu_lens=txt_cu_seqlens,
+                img_cu_lens=img_cu_seqlens,
+                temb=temb,
+                image_rotary_emb=ms_pe,
+                joint_attention_kwargs=attention_kwargs,
+            )
+        img = self.norm_out(img, temb, cu_seqlens=img_cu_seqlens)
+        img = self.proj_out(img)
+        return img
+
+
+class _SyntheticRoPE:
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def __call__(self, img_shapes, device):
+        import torch
+
+        if img_shapes is None:
+            return torch.zeros(self.dim, device=device)
+        b, h, w = img_shapes[0][0]
+        return torch.zeros(1, h, w, self.dim, device=device)
+
+
+class _SyntheticTimeEmbed:
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def __call__(self, timesteps, img):
+        import torch
+
+        return torch.zeros(img.shape[0], self.dim, dtype=img.dtype, device=img.device)
+
+
+class _SynthBlock:
+    def __init__(self, dim: int) -> None:
+        import torch.nn as nn
+
+        self.img_proj = nn.Linear(dim, dim)
+        self.txt_proj = nn.Linear(dim, dim)
+
+    def __call__(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb,
+                 txt_cu_lens, img_cu_lens, joint_attention_kwargs=None):
+        return self.forward(hidden_states, encoder_hidden_states, temb, image_rotary_emb,
+                            txt_cu_lens, img_cu_lens, joint_attention_kwargs)
+
+    def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb,
+                txt_cu_lens, img_cu_lens, joint_attention_kwargs=None):
+        import torch.nn.functional as F
+
+        img = F.silu(self.img_proj(hidden_states))
+        txt = F.silu(self.txt_proj(encoder_hidden_states))
+        return txt, img
+
+
+class _SyntheticAdaLN:
+    def __init__(self, dim: int) -> None:
+        import torch.nn as nn
+
+        self.norm = nn.LayerNorm(dim)
+
+    def __call__(self, img, temb, cu_seqlens=None):
+        return self.norm(img)
+
+
+class SyntheticAdapterBackend:
+    """Plugs the synthetic transformer into the adapter using recorded logical
+    devices and a no-op CPU mover that records transfer events."""
+
+    def __init__(self, synthetic: SyntheticTransformer) -> None:
+        self.synthetic = synthetic
+        self.block_devices: Dict[int, str] = {}
+        self.transfers: List[Dict[str, Any]] = []
+        self.block_events: List[Dict[str, Any]] = []
+
+    def make_block_devices(self, num_blocks: int, split: int, dev0: str, dev1: str) -> Dict[int, str]:
+        return {i: (dev0 if i < split else dev1) for i in range(num_blocks)}
+
+    def run_reference(self, img, txt, timesteps, img_shapes=None, cu_i=None, cu_t=None):
+        return self.synthetic.forward(img, txt, timesteps, img_shapes, cu_i, cu_t)
+
+    def run_partitioned(self, img, txt, timesteps, block_devices, dev0, dev1, img_shapes=None, cu_i=None, cu_t=None):
+        adapter = DualDeviceForwardAdapter(
+            self.synthetic,
+            block_devices,
+            transfer_helper=CrossDeviceTransferHelper(mover=_cpu_mover),
+            telemetry=None,
+        )
+        adapter.attach()
+        try:
+            out = adapter._wrapped_forward(img, txt, timesteps, img_shapes, cu_i, cu_t)
+        finally:
+            adapter.detach()
+        self.block_events = adapter.block_events
+        self.transfers = adapter.transfer_helper.events
+        self.block_devices = block_devices
+        return out
+
+
+def _cpu_mover(value: Any, device: str) -> Any:
+    """Synthetic CPU mover: tensors stay put; retag is a label operation."""
+    if isinstance(value, DeviceTaggedTensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_cpu_mover(v, device) for v in value)
+    if isinstance(value, list):
+        return [_cpu_mover(v, device) for v in value]
+    if isinstance(value, dict):
+        return {k: _cpu_mover(v, device) for k, v in value.items()}
+    return value
+
+
+def resolve_device_label(value: Any) -> str:
+    """Return the canonical device label of a torch tensor or logical
+    (DeviceTaggedTensor) wrapper. Raises when it cannot be determined.
+
+    Import-safety: importing this function never initializes CUDA.
+    """
+    dev = getattr(value, "device", None)
+    if dev is None:
+        raise RuntimeError(
+            "DEVICE_CONTRACT_DEVICE_UNKNOWN: object carries no device; "
+            "cannot satisfy the device contract"
+        )
+    return str(dev)
