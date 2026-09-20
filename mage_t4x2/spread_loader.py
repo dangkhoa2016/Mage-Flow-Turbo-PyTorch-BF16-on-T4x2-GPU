@@ -230,3 +230,250 @@ def _resolve_group_leaf_modules(
     if path == "transformer.pre":
         return list(discover_transformer_pre_modules(tr).values())
     return list(discover_transformer_post_modules(tr).values())
+
+
+def build_placement_leaf_report(
+    model: Any,
+    leaves: list,
+    *,
+    text_encoder_attr: str = "txt_enc",
+    transformer_attr: str = "transformer",
+    vae_attr: str = "vae",
+) -> Dict[str, Any]:
+    """Per-leaf actual-vs-planned placement record (deterministic).
+
+    Every planned leaf receives exactly one record:
+      * module not found on the model  -> MISSING
+      * module present but parameterless -> PASS (vacuously, nothing to place)
+      * module present with tensors    -> PASS when every device matches
+    """
+    leaf_records: list = []
+    missing: list = []
+    mismatches: list = []
+    for path, planned in leaves:
+        if path in ("transformer.pre", "transformer.post"):
+            modules = _resolve_group_leaf_modules(
+                model, path, transformer_attr=transformer_attr
+            )
+            if not modules:
+                missing.append(path)
+                leaf_records.append(
+                    {"path": path, "planned_device": planned, "observed_device": "N/A", "status": "MISSING"}
+                )
+                continue
+            ok = all(
+                str(d) == str(planned)
+                for mod in modules for d in _observed_leaf_devices(mod)
+            )
+            observed_device = ", ".join(
+                sorted({str(d) for mod in modules for d in _observed_leaf_devices(mod)})
+            ) or "N/A (no tensors)"
+            if not ok:
+                mismatches.append(
+                    f"{path}: expected {planned} but observed pre/post modules not on that device"
+                )
+            leaf_records.append(
+                {
+                    "path": path,
+                    "planned_device": planned,
+                    "observed_device": observed_device,
+                    "status": "PASS" if ok else "FAIL",
+                }
+            )
+            continue
+
+        module = _resolve_leaf_module_for_validation(
+            model, path,
+            text_encoder_attr=text_encoder_attr,
+            transformer_attr=transformer_attr,
+            vae_attr=vae_attr,
+        )
+        if module is None:
+            missing.append(path)
+            leaf_records.append(
+                {"path": path, "planned_device": planned, "observed_device": "N/A", "status": "MISSING"}
+            )
+            continue
+        devs = _observed_leaf_devices(module)
+        if not devs:
+            leaf_records.append(
+                {
+                    "path": path,
+                    "planned_device": planned,
+                    "observed_device": "N/A (no tensors)",
+                    "status": "PASS",
+                }
+            )
+            continue
+        ok = all(str(d) == str(planned) for d in devs)
+        observed_device = devs[0] if len(devs) == 1 else ", ".join(devs)
+        if not ok:
+            mismatches.append(f"{path}: expected {planned} but observed {devs}")
+        leaf_records.append(
+            {
+                "path": path,
+                "planned_device": planned,
+                "observed_device": observed_device,
+                "status": "PASS" if ok else "FAIL",
+            }
+        )
+    record_paths = {r["path"] for r in leaf_records}
+    unexpected = sorted(p for p, _ in leaves if p not in record_paths)
+    return {
+        "status": "PASS" if not missing and not mismatches and not unexpected else "FAIL",
+        "planned_leaf_count": len(leaves),
+        "observed_leaf_count": len(leaf_records) - len(missing),
+        "mismatches": sorted(mismatches),
+        "missing": sorted(missing),
+        "unexpected": unexpected,
+        "leaves": leaf_records,
+    }
+
+
+def default_validate_placement(
+    model: Any,
+    plan: Dict[str, Any],
+    *,
+    text_encoder_attr: str = "txt_enc",
+    transformer_attr: str = "transformer",
+    vae_attr: str = "vae",
+    expected_devices: Optional[set] = None,
+) -> Dict[str, Any]:
+    import types
+
+    device_plan = plan["device_plan"]
+    leaves = list(iter_device_plan_leaves(device_plan))
+
+    state = types.SimpleNamespace(
+        text_encoder=getattr(model, text_encoder_attr, None),
+        transformer=getattr(model, transformer_attr, None),
+        vae=getattr(model, vae_attr, None),
+    )
+    structural = validate_runtime_device_plan(state, device_plan)
+    leaf_report = build_placement_leaf_report(
+        model,
+        leaves,
+        text_encoder_attr=text_encoder_attr,
+        transformer_attr=transformer_attr,
+        vae_attr=vae_attr,
+    )
+
+    if expected_devices is None:
+        planned_cuda = {
+            dev for _path, dev in leaves
+            if isinstance(dev, str) and dev.startswith("cuda")
+        }
+        for key in ("text_encoder_device", "vae_device"):
+            value = plan.get(key)
+            if value is not None and str(value).startswith("cuda"):
+                planned_cuda.add(str(value))
+        expected = planned_cuda or {"cuda:0", "cuda:1"}
+    else:
+        expected = {str(d) for d in expected_devices}
+    expected = {d for d in expected if d.startswith("cuda")}
+
+    spread_ok = no_full_model_single_cuda(model, expected_devices=expected or {"cuda:0", "cuda:1"})
+    mismatches = list(dict.fromkeys(
+        (structural.get("mismatches") or []) + leaf_report["mismatches"]
+    ))
+    if leaf_report["missing"]:
+        mismatches.append(f"planned modules missing from model: {leaf_report['missing']}")
+    if leaf_report["unexpected"]:
+        mismatches.append(f"unvalidated planned leaves: {leaf_report['unexpected']}")
+    if not spread_ok:
+        mismatches.append("model parameters/buffers do not span the expected dual CUDA devices")
+    return {
+        "status": (
+            "PASS"
+            if structural.get("status") == "PASS"
+            and leaf_report["status"] == "PASS"
+            and spread_ok
+            and not mismatches
+            else "FAIL"
+        ),
+        "structural": structural,
+        "spread_across_gpus": spread_ok,
+        "cuda_devices_in_use": sorted(cuda_devices_in_use(model)),
+        "mismatches": sorted(set(mismatches)),
+        "placement": leaf_report,
+    }
+
+
+@dataclasses.dataclass
+class SpreadLoadDependencies:
+    """Injectables; ``None`` selects the default CPU-tested implementation."""
+
+    builder: Optional[Callable[..., Any]] = None
+    measure: Optional[Callable[[Any], Dict[str, Any]]] = None
+    plan: Optional[Callable[..., Dict[str, Any]]] = None
+    move: Optional[Callable[[Any, Dict[str, Any]], Dict[str, Any]]] = None
+    validate: Optional[Callable[[Any, Dict[str, Any]], Dict[str, Any]]] = None
+
+    def resolve(self) -> "SpreadLoadDependencies":
+        from functools import partial
+
+        return SpreadLoadDependencies(
+            builder=self.builder,
+            measure=self.measure or _default_measure,
+            plan=self.plan or partial(_default_plan),
+            move=self.move or default_move_by_plan,
+            validate=self.validate or default_validate_placement,
+        )
+
+
+def spread_load(
+    model_path: str,
+    deps: SpreadLoadDependencies,
+    *,
+    gpu0_total_bytes: int = C.T4_USABLE_VRAM_BYTES,
+    gpu1_total_bytes: int = C.T4_USABLE_VRAM_BYTES,
+    reserved_headroom_bytes: int = C.RESERVED_RUNTIME_HEADROOM_BYTES,
+) -> Dict[str, Any]:
+    """Stage on CPU, plan, spread, validate. Returns the model + evidence.
+
+    Raises RuntimeError (fail closed) when the plan is not conservative or the
+    independent budget re-check fails.
+    """
+    resolved = deps.resolve()
+    model = resolved.builder(model_path, "cpu")
+
+    component_bytes = resolved.measure(model)
+    memory_plan = resolved.plan(
+        component_bytes,
+        gpu0_total_bytes=gpu0_total_bytes,
+        gpu1_total_bytes=gpu1_total_bytes,
+        reserved_headroom_bytes=reserved_headroom_bytes,
+    )
+    if memory_plan.get("status") != "PASS":
+        raise RuntimeError(
+            f"MEMORY_PLAN_FAIL: no conservative dual-T4 spread plan; "
+            f"{memory_plan.get('reason')}; single_device="
+            f"{memory_plan.get('single_device', {}).get('status')}"
+        )
+
+    recheck = validate_plan_within_budget(memory_plan)
+    if recheck.get("status") != "PASS":
+        raise RuntimeError(
+            f"MEMORY_PLAN_FAIL: independent budget recheck failed: {recheck.get('violations')}"
+        )
+
+    observed = resolved.move(model, memory_plan)
+    placement_validation = resolved.validate(model, memory_plan)
+    if placement_validation.get("status") != "PASS":
+        raise RuntimeError(
+            f"SPREAD_LOAD_PLACEMENT_MISMATCH: observed placement does not match the "
+            f"authority dual-T4 plan: {placement_validation.get('mismatches')}"
+        )
+
+    return {
+        "model": model,
+        "model_path": model_path,
+        "component_bytes": component_bytes,
+        "memory_plan": memory_plan,
+        "observed_placement": observed,
+        "placement_validation": placement_validation,
+        "no_full_model_cuda0_materialization": bool(
+            placement_validation.get("spread_across_gpus")
+        ),
+        "reserved_runtime_headroom_bytes": reserved_headroom_bytes,
+    }
