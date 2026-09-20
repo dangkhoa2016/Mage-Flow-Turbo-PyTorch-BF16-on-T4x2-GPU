@@ -2064,3 +2064,261 @@ class R2GDriver:
         g2_telemetry = parse_telemetry(str(g2_telemetry_path))
 
         g2_blocked = _records_for(g2_telemetry, session.session_id, g2.inference_id, "block_forward")
+        g2_cross_events = _records_for(g2_telemetry, session.session_id, g2.inference_id, "cross_device_transfer")
+        g2_return_events = _records_for(g2_telemetry, session.session_id, g2.inference_id, "transformer_output_return_transfer")
+        g2_vae_events = _records_for(g2_telemetry, session.session_id, g2.inference_id, "vae_input_transfer")
+
+        # GPU participation
+        g2_gpu0 = any(str(e.get("device")) == "cuda:0" for e in g2_blocked)
+        g2_gpu1 = any(str(e.get("device")) == "cuda:1" for e in g2_blocked)
+        self.summary["g2_gpu0_participation"] = bool(g2_gpu0)
+        self.summary["g2_gpu1_participation"] = bool(g2_gpu1)
+        self.require("G2_GPU0_PARTICIPATION", g2_gpu0, "G2 GPU0 absent")
+        self.require("G2_GPU1_PARTICIPATION", g2_gpu1, "G2 GPU1 absent")
+
+        # Block routing (BLOCK_ROUTING gate; never feeds TRANSFER/POST_HEAD)
+        g2_observed_blocks: Dict[int, str] = {}
+        for ev in g2_blocked:
+            g2_observed_blocks[int(ev.get("block"))] = str(ev.get("device"))
+        g2_routing = adjudicate_block_routing(g2_observed_blocks, plan_blocks, num_blocks_live)
+        self.summary["block_routing_g2"] = g2_routing
+        self.require("G2_BLOCK_ROUTING", g2_routing["pass"], "G2 block routing mismatch")
+
+        # Cross-device transfer 0->1 (split-boundary endpoints, strict count)
+        cross_adj = adjudicate_transfer_cardinality(
+            g2_cross_events,
+            from_device=cross_from,
+            to_device=cross_to,
+            expected_count=int(contract.steps),
+        )
+        self.summary["g2_transfer_0_to_1_event_count"] = cross_adj["event_count"]
+        self.summary["g2_transfer_0_to_1_expected_count"] = cross_adj["expected_count"]
+        self.summary["g2_transfer_0_to_1_valid"] = cross_adj["pass"]
+        self.require(
+            "G2_TRANSFER_0_TO_1",
+            cross_adj["pass"],
+            "G2 cross_device_transfer cardinality invalid",
+        )
+
+        # Transformer return via post/head witness (strict cardinality)
+        return_adj = adjudicate_transfer_cardinality(
+            g2_return_events,
+            from_device=post_head_expected,
+            to_device=latent_anchor,
+            expected_count=int(contract.steps),
+        )
+        self.summary["g2_transformer_return_event_count"] = return_adj["event_count"]
+        self.summary["g2_transformer_return_expected_count"] = return_adj["expected_count"]
+        self.summary["g2_transformer_return_valid"] = return_adj["pass"]
+        self.require(
+            "G2_TRANSFORMER_RETURN_1_TO_0",
+            return_adj["pass"],
+            "G2 transformer return transfer invalid",
+        )
+
+        # Post/head device proof (expected cross-check + audited witness)
+        post_head_adj = adjudicate_post_head_device(
+            g2_return_events,
+            expected_device=post_head_expected,
+            expected_count=int(contract.steps),
+            anchor_device=latent_anchor,
+        )
+        observed_form = (
+            post_head_expected
+            if post_head_adj["pass"]
+            else "MISMATCH(%s)"
+            % ("|".join(post_head_adj["observed_from_devices"]) or "NO_RETURN_EVENTS")
+        )
+        self.summary["post_head_device_observed"] = observed_form
+        self.summary["post_head_device_valid"] = post_head_adj["pass"]
+        self.require(
+            "G2_POST_HEAD_DEVICE",
+            post_head_adj["pass"],
+            "G2 post/head device witness invalid",
+        )
+
+        # VAE input transfer (strict cardinality == 1)
+        vae_adj = adjudicate_transfer_cardinality(
+            g2_vae_events,
+            from_device=latent_anchor,
+            to_device=actual_vae_device,
+            expected_count=1,
+        )
+        self.summary["g2_vae_input_transfer_event_count"] = vae_adj["event_count"]
+        self.summary["g2_vae_input_transfer_expected_count"] = vae_adj["expected_count"]
+        self.summary["g2_vae_input_transfer_valid"] = vae_adj["pass"]
+        self.require(
+            "G2_VAE_INPUT_TRANSFER",
+            vae_adj["pass"],
+            f"G2 VAE input transfer to {actual_vae_device} invalid",
+        )
+
+        # R2A sec 6: observed NO-CPU-FALLBACK over live + observed + telemetry
+        scoped_records: List[Dict[str, Any]] = []
+        for ev in g2_blocked:
+            scoped_records.append(ev)
+        scoped_records.extend(g2_cross_events)
+        scoped_records.extend(g2_return_events)
+        scoped_records.extend(g2_vae_events)
+        ncf = adjudicate_no_cpu_fallback_r2b(live_placements, pv_observed, scoped_records)
+        self.summary["no_cpu_fallback_observed"] = ncf["no_cpu_fallback_observed"]
+        self.summary["no_cpu_fallback_adjudication"] = ncf["no_cpu_fallback_adjudication"]
+        self.require(
+            "NO_CPU_FALLBACK_OBSERVED",
+            ncf["no_cpu_fallback_observed"],
+            "CPU fallback observed in live placement, observed validation, or telemetry",
+        )
+
+        # G2 phase block integrity (per-invocation multi-step)
+        g2_integrity = phase_block_integrity(g2.observed_facts)
+        self.summary["g2_block_order_valid"] = g2_integrity["block_order_valid"]
+        self.summary["g2_no_skipped_blocks"] = g2_integrity["no_skipped_blocks"]
+        self.summary["g2_no_duplicated_blocks"] = g2_integrity["no_duplicated_blocks"]
+        self.summary["g2_cross_inference_clean"] = g2_integrity["cross_inference_clean"]
+        self.summary["phase_block_integrity_g2"] = g2_integrity
+        self.require("G2_EXACT_BLOCK_COVERAGE", g2_integrity["block_order_valid"], "G2 block order invalid")
+        self.require("G2_NO_SKIPPED_BLOCKS", g2_integrity["no_skipped_blocks"], "G2 skipped blocks")
+        self.require("G2_NO_DUPLICATED_BLOCKS", g2_integrity["no_duplicated_blocks"], "G2 duplicated blocks")
+        self.require("G2_CROSS_INFERENCE_CLEAN", g2_integrity["cross_inference_clean"], "G2 cross-inference contamination")
+        print("G2_ROUTING=PASS")
+
+        # --- G2 output acceptance -------------------------------------------
+        g2_image = validate_image(g2.output_path)
+        g2_no_nan = bool((g2.observed_facts or {}).get("NO_NAN"))
+        g2_no_inf = bool((g2.observed_facts or {}).get("NO_INF"))
+        output_acceptance = build_output_acceptance(
+            image_valid=bool(g2_image.get("valid")),
+            no_nan=g2_no_nan,
+            no_inf=g2_no_inf,
+            path_exists=bool(g2.output_path and Path(g2.output_path).is_file()),
+        )
+        self.summary["g2_image_validation"] = g2_image
+        self.summary["g2_no_nan"] = g2_no_nan
+        self.summary["g2_no_inf"] = g2_no_inf
+        self.summary["g2_output_valid"] = output_acceptance["valid"]
+        self.require(
+            "G2_OUTPUT_VALID",
+            bool(output_acceptance["valid"]),
+            f"G2 output invalid: {g2_image}",
+        )
+
+        # --- G2 phase acceptance (whole trajectory) ---------------------------
+        g2_acceptance_ok = (g2.acceptance or {}).get("status") == "PASS"
+        self.require("G2_ACCEPTANCE", g2_acceptance_ok, "G2 phase acceptance not PASS")
+
+        # --- Final adjudication -----------------------------------------------
+        self.summary["status"] = "PASS"
+        self.summary["g3_g6_executed"] = False
+        session.save_status(str(Path(evidence_root) / "session-status.json"))
+        _write_summary_best_effort(self, self.summary, evidence_root)
+        _print_human_summary(self.summary)
+        print("FINAL_VERDICT=PASS")
+        return self.summary
+
+
+# ---------------------------------------------------------------------------
+# Summary output
+# ---------------------------------------------------------------------------
+
+
+def _print_human_summary(s: Dict[str, Any]) -> None:
+    def mark(ok: bool) -> str:
+        return "PASS" if ok else "FAIL"
+
+    g2_ok = s.get("status") == "PASS" and s.get("g2_status") == "PASS"
+    verdict = "PASS" if g2_ok else "FAIL"
+    print("=" * 60)
+    print("=== G2 ROUTING AUTHORITY R2G SUMMARY (R2B/R2C-corrective preserved; multistep block-integrity corrective) ===")
+    print(f"SESSION_ID={s.get('session_id')}")
+    print(f"SESSION_STATE={s.get('session_state')}")
+    print(f"EVIDENCE_ROOT={s.get('evidence_root')}")
+    print(f"R2G_RUNTIME_BASELINE_INTEGRITY={_human_passthrough(s, 'R2G_RUNTIME_BASELINE_INTEGRITY')}")
+    print(f"BOOTSTRAP_REQUIREMENTS_LOCK={_human_passthrough(s, 'BOOTSTRAP_REQUIREMENTS_LOCK')}")
+    print(f"BOOTSTRAP_WHEELHOUSE_INTEGRITY={_human_passthrough(s, 'BOOTSTRAP_WHEELHOUSE_INTEGRITY')}")
+    print(f"BOOTSTRAP_LOCAL_SITE_FRESH={_human_passthrough(s, 'BOOTSTRAP_LOCAL_SITE_FRESH')}")
+    print(f"BOOTSTRAP_LOCAL_PROVISION={_human_passthrough(s, 'BOOTSTRAP_LOCAL_PROVISION')}")
+    print(f"BOOTSTRAP_LOCAL_VERSION_VERIFY={_human_passthrough(s, 'BOOTSTRAP_LOCAL_VERSION_VERIFY')}")
+    print(f"BOOTSTRAP_LOCAL_ORIGIN_VERIFY={_human_passthrough(s, 'BOOTSTRAP_LOCAL_ORIGIN_VERIFY')}")
+    print(f"UPSTREAM_BOOTSTRAP={mark((s.get('upstream_bootstrap') or {}).get('source_root') is not None)}")
+    print(f"P0={_human_passthrough(s, 'p0_status')}")
+    print(f"G0={mark(s.get('g0_status') == 'PASS')}")
+    print(f"L0={mark(s.get('l0_status') == 'PASS')}")
+    print(f"SDPA={mark((s.get('sdpa') or {}).get('status') == 'PASS')}")
+    print(f"MODEL_LOAD_COUNT={s.get('model_load_count')}")
+    print(f"SPLIT_BLOCK={s.get('split_block')}")
+    print(f"NUM_BLOCKS={s.get('num_blocks')}")
+    print(f"G1={mark(s.get('g1_status') == 'PASS')}")
+    print(f"G1_INFERENCE_ID={s.get('g1_inference_id')}")
+    print(f"G2={mark(g2_ok)}")
+    print(f"G2_INFERENCE_ID={s.get('g2_inference_id')}")
+    print(f"RUNTIME_STATE_ID_STABLE={human_fact(s, 'runtime_state_id_stable')}")
+    print(f"TRANSFORMER_ID_STABLE={human_fact(s, 'transformer_id_stable')}")
+    print(f"TEXT_ENCODER_ID_STABLE={human_fact(s, 'text_encoder_id_stable')}")
+    print(f"VAE_ID_STABLE={human_fact(s, 'vae_id_stable')}")
+    print(f"EXACT_BLOCK_COVERAGE={human_fact(s, 'g2_block_order_valid')}")
+    print(f"BLOCK_ORDER={human_fact(s, 'g2_block_order_valid')}")
+    print(f"NO_SKIP={human_fact(s, 'g2_no_skipped_blocks')}")
+    print(f"NO_DUPLICATE_WITHIN_INVOCATION={human_fact(s, 'g2_no_duplicated_blocks')}")
+    print(f"GPU0_PARTICIPATION={human_fact(s, 'g2_gpu0_participation')}")
+    print(f"GPU1_PARTICIPATION={human_fact(s, 'g2_gpu1_participation')}")
+    print(f"EXPECTED_TRANSFORMER_INVOCATIONS={s.get('expected_transformer_invocations')}")
+    print(f"TRANSFER_0_TO_1_COUNT={s.get('g2_transfer_0_to_1_event_count')}/{s.get('g2_transfer_0_to_1_expected_count')}")
+    print(f"TRANSFER_0_TO_1={human_fact(s, 'g2_transfer_0_to_1_valid')}")
+    print(f"TRANSFORMER_RETURN_1_TO_0_COUNT={s.get('g2_transformer_return_event_count')}/{s.get('g2_transformer_return_expected_count')}")
+    print(f"TRANSFORMER_RETURN_1_TO_0={human_fact(s, 'g2_transformer_return_valid')}")
+    print(f"POST_HEAD_DEVICE_EXPECTED={s.get('post_head_device_expected')}")
+    print(f"POST_HEAD_DEVICE_OBSERVED={s.get('post_head_device_observed')}")
+    print(f"POST_HEAD_DEVICE={human_fact(s, 'post_head_device_valid')}")
+    print(f"VAE_INPUT_TRANSFER_COUNT={s.get('g2_vae_input_transfer_event_count')}/{s.get('g2_vae_input_transfer_expected_count')}")
+    print(f"VAE_INPUT_TRANSFER={human_fact(s, 'g2_vae_input_transfer_valid')}")
+    print(f"CPU_FALLBACK_FORBIDDEN_CONFIG={human_fact(s, 'cpu_fallback_forbidden_config')}")
+    print(f"NO_CPU_FALLBACK_OBSERVED={human_fact(s, 'no_cpu_fallback_observed')}")
+    print(f"NO_NAN={human_fact(s, 'g2_no_nan')}")
+    print(f"NO_INF={human_fact(s, 'g2_no_inf')}")
+    print(f"OUTPUT_VALID={human_fact(s, 'g2_output_valid')}")
+    print(f"G3_G6_EXECUTED={human_g3_g6(s)}")
+    print(f"FINAL_VERDICT={verdict}")
+    print("=" * 60)
+
+
+def _write_summary_best_effort(
+    driver: R2GDriver, summary: Dict[str, Any], evidence_root: Path
+) -> Optional[Path]:
+    summary_path = Path(evidence_root) / "corrective-summary.json"
+    summary["corrective_summary_path"] = str(summary_path)
+    try:
+        _write_json(summary_path, summary)
+        return summary_path
+    except Exception:
+        if summary.get("status") == "PASS":
+            raise
+        return None
+
+
+def _run_driver() -> int:
+    evidence_root = (
+        REPO
+        / "evidence"
+        / "gpu"
+        / ("g2-routing-authority-r2g-fresh-%s-%s" % (time.strftime("%Y%m%dT%H%M%SZ"), uuid.uuid4().hex[:8]))
+    )
+    driver = R2GDriver(evidence_root)
+    summary = None
+    try:
+        summary = driver.run()
+    except AuthorityGateFailure as exc:
+        driver.collect_failure_evidence(exc)
+    except Exception as exc:
+        driver.collect_failure_evidence(exc)
+    if summary is None:
+        summary = driver.summary
+    _write_summary_best_effort(driver, summary, evidence_root)
+    _print_human_summary(summary)
+    if summary.get("status") != "PASS":
+        print(f"FINAL_VERDICT=FAIL first_failed_gate={summary.get('first_failed_gate')}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_run_driver())
