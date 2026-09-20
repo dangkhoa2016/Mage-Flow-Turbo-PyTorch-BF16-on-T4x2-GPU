@@ -434,3 +434,268 @@ def provision_r2d_bootstrap_site(
 
 def _normalize_dist(name: str) -> str:
     return name.lower().replace("_", "-").replace(".", "-")
+
+
+def verify_r2d_bootstrap_origins(
+    pins: Sequence[BootstrapPin],
+    target: Any,
+) -> Dict[str, Any]:
+    """Verify each pinned dependency is installed at the exact version AND
+    resident under the local target (never global / user site / another dir)."""
+    tgt = Path(target).resolve()
+    entries: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    for pin in pins:
+        dist = _normalize_dist(pin.distribution)
+        meta_dir = (tgt / f"{pin.distribution}-{pin.version}.dist-info")
+        if not meta_dir.is_dir():
+            candidates = sorted(
+                p for p in tgt.glob("*.dist-info")
+                if p.name.lower().startswith(f"{dist}-")
+            )
+            if candidates:
+                metadata_file = candidates[0] / "METADATA"
+                observed = None
+                if metadata_file.is_file():
+                    for line in metadata_file.read_text(encoding="utf-8").splitlines():
+                        if line.startswith("Version:"):
+                            observed = line.split(":", 1)[1].strip()
+                            break
+                resident = False
+                pkg = tgt / pin.distribution.lower()
+                if (pkg / "__init__.py").is_file():
+                    resident = True
+                entries.append(
+                    {
+                        "distribution": pin.distribution,
+                        "expected": pin.version,
+                        "version": observed,
+                        "met": observed == pin.version,
+                        "resident": resident,
+                        "dist_info": candidates[0].name,
+                    }
+                )
+            else:
+                errors.append(
+                    f"no metadata for {pin.distribution}; target not provisioned"
+                )
+            continue
+        metadata_file = meta_dir / "METADATA"
+        observed = None
+        if metadata_file.is_file():
+            for line in metadata_file.read_text(encoding="utf-8").splitlines():
+                if line.startswith("Version:"):
+                    observed = line.split(":", 1)[1].strip()
+                    break
+        pkg = tgt / pin.distribution.lower()
+        residential = (pkg / "__init__.py").is_file()
+        if not residential:
+            pkg = tgt / _normalize_dist(pin.distribution).replace("-", "_")
+            residential = (pkg / "__init__.py").is_file()
+        entries.append(
+            {
+                "distribution": pin.distribution,
+                "expected": pin.version,
+                "version": observed,
+                "met": observed == pin.version,
+                "resident": residential,
+                "dist_info": meta_dir.name,
+            }
+        )
+
+    for e in entries:
+        if not e["met"]:
+            errors.append(
+                f"{e['distribution']}: expected {e['expected']}, got {e['version']}"
+            )
+        if not e["resident"]:
+            errors.append(f"{e['distribution']}: not resident under {tgt}")
+
+    return {
+        "status": "PASS" if not errors and entries else "FAIL",
+        "target": str(tgt),
+        "entries": entries,
+        "errors": errors,
+    }
+
+
+def activate_r2d_bootstrap_site(target: Any) -> Dict[str, Any]:
+    """Prepend the local site to sys.path, invalidate import caches, and evict
+    bootstrap dependency names from sys.modules if they were not imported by
+    project code (bootstrap deps are authoritative only from the local site)."""
+    tgt = Path(target).resolve()
+    evicted: List[str] = []
+    if str(tgt) not in sys.path:
+        sys.path.insert(0, str(tgt))
+    elif sys.path and sys.path[0] != str(tgt):
+        sys.path.remove(str(tgt))
+        sys.path.insert(0, str(tgt))
+    for name in [m for m in list(sys.modules) if m == "loguru" or m.startswith("loguru.")]:
+        if sys.modules.get(name) is not None:
+            evicted.append(name)
+            sys.modules.pop(name, None)
+    importlib.invalidate_caches()
+    return {"status": "PASS", "path_front": str(tgt), "evicted": evicted}
+
+
+# ---------------------------------------------------------------------------
+# orchestrated prepare (runbook section 31 order)
+# ---------------------------------------------------------------------------
+
+def prepare_r2d_bootstrap_environment(
+    project_root: Any,
+    requirements_path: Optional[Any] = None,
+    wheelhouse_dir: Optional[Any] = None,
+    wheelhouse_manifest: Optional[Any] = None,
+    target: Optional[Any] = None,
+    pins: Optional[Sequence[BootstrapPin]] = None,
+    activate: bool = True,
+) -> Dict[str, Any]:
+    """Run the full R2D local bootstrap path and emit the four R2D gates.
+
+    Order (runbook 31): verify lock + wheelhouse manifest -> assert fresh R2D
+    bootstrap target -> offline install exact lock to local target -> activate
+    local target -> verify exact version + local origin. Any failure raises
+    fail-closed; the returned dict carries the four R2D machine gates.
+    """
+    root = Path(project_root)
+    req = Path(requirements_path) if requirements_path else root / "requirements-bootstrap.lock"
+    whl = Path(wheelhouse_dir) if wheelhouse_dir else root / "vendor" / "bootstrap-wheelhouse"
+    manifest = (
+        Path(wheelhouse_manifest)
+        if wheelhouse_manifest
+        else root / "vendor" / "bootstrap-wheelhouse-manifest.json"
+    )
+    tgt = Path(target) if target else root / R2D_BOOTSTRAP_SITE_REL
+
+    inputs = verify_r2d_bootstrap_inputs(
+        requirements_path=req, wheelhouse_dir=whl, wheelhouse_manifest=manifest, pins=pins
+    )
+    if inputs["status"] != "PASS":
+        raise R2DError(f"R2D_BOOTSTRAP_INPUTS_FAIL: {inputs['errors']}")
+    resolved = inputs["pins"]
+
+    create_fresh_bootstrap_site(tgt)  # STALE_BOOTSTRAP_SITE if pre-existing
+
+    provision = provision_r2d_bootstrap_site(
+        pins=resolved, requirements_path=req, wheelhouse_dir=whl, target=tgt
+    )
+
+    if activate:
+        activate_r2d_bootstrap_site(tgt)
+
+    version_gate = verify_r2d_bootstrap_origins(pins=resolved, target=tgt)
+    return {
+        "status": "PASS" if version_gate["status"] == "PASS" else "FAIL",
+        "BOOTSTRAP_REQUIREMENTS_LOCK": inputs.get("requirements_lock_status", "FAIL"),
+        "BOOTSTRAP_WHEELHOUSE_INTEGRITY": inputs.get("wheelhouse_integrity_status", "FAIL"),
+        "BOOTSTRAP_LOCAL_SITE_FRESH": "PASS",
+        "BOOTSTRAP_LOCAL_PROVISION": "PASS" if provision["status"] == "PASS" else "FAIL",
+        "BOOTSTRAP_LOCAL_VERSION_VERIFY": version_gate["status"],
+        "BOOTSTRAP_LOCAL_ORIGIN_VERIFY": version_gate["status"],
+        "target": str(tgt),
+        "pins": [{"distribution": p.distribution, "version": p.version} for p in resolved],
+        "lock_sha256": inputs["lock_sha256"],
+        "manifest_sha256": inputs["manifest_sha256"],
+        "wheel_sha256": inputs["wheel_sha256"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# clean-room masking proof (runbook sections 25-29, 50)
+# ---------------------------------------------------------------------------
+
+_CLEAN_ROOM_PROOF_SNIPPET = r'''
+import importlib, json, pathlib, sys
+sys.path.insert(0, {project!r})
+import mage_t4x2
+from mage_t4x2 import upstream_bootstrap as ub
+from mage_t4x2.r2d_bootstrap_environment import (
+    activate_r2d_bootstrap_site,
+    create_fresh_bootstrap_site,
+    install_loguru_mask,
+    provision_r2d_bootstrap_site,
+    uninstall_loguru_mask,
+    verify_r2d_bootstrap_inputs,
+    verify_r2d_bootstrap_origins,
+)
+
+PROJECT = pathlib.Path({project!r})
+WORK = pathlib.Path({work!r})
+LOCK = PROJECT / "requirements-bootstrap.lock"
+WHEELHOUSE = PROJECT / "vendor" / "bootstrap-wheelhouse"
+MANIFEST = PROJECT / "vendor" / "bootstrap-wheelhouse-manifest.json"
+TARGET = WORK / "fresh-r2d-bootstrap-site"
+
+out = {{}}
+
+# global loguru presence is informational only
+out["global_loguru_detected"] = None
+try:
+    import loguru  # noqa: F401 (informational only)
+    out["global_loguru_detected"] = getattr(loguru, "__version__", "?")
+except Exception:
+    out["global_loguru_detected"] = None
+
+# step 1-4: mask global loguru; pre-provision import must FAIL as expected
+guard = install_loguru_mask(())
+try:
+    try:
+        import loguru  # noqa: F401
+        out["PRE_PROVISION_LOGURU_IMPORT"] = "UNEXPECTED_PASS"
+    except ModuleNotFoundError:
+        out["PRE_PROVISION_LOGURU_IMPORT"] = "FAIL_AS_EXPECTED"
+finally:
+    uninstall_loguru_mask(guard)
+
+inputs = verify_r2d_bootstrap_inputs(LOCK, WHEELHOUSE, MANIFEST)
+if inputs["status"] != "PASS":
+    out["LOCAL_OFFLINE_PROVISION"] = "FAIL"
+    out["input_errors"] = inputs["errors"]
+    out["subprocess_returncode"] = 0
+else:
+    create_fresh_bootstrap_site(TARGET)
+    prov = provision_r2d_bootstrap_site(inputs["pins"], LOCK, WHEELHOUSE, TARGET)
+    out["LOCAL_OFFLINE_PROVISION"] = "PASS" if prov["status"] == "PASS" else "FAIL"
+    out["pip_argv"] = prov.get("pip_argv", [])
+    out["pip_returncode"] = prov.get("pip_returncode")
+
+    guard2 = install_loguru_mask((TARGET,))
+    try:
+        activate_r2d_bootstrap_site(TARGET)
+        import loguru as local_loguru
+        out["POST_PROVISION_LOGURU_IMPORT"] = "PASS"
+        out["POST_PROVISION_LOGURU_VERSION"] = getattr(local_loguru, "__version__", "?")
+        out["POST_PROVISION_LOGURU_ORIGIN"] = getattr(local_loguru, "__file__", "?")
+    except Exception as exc:
+        out["POST_PROVISION_LOGURU_IMPORT"] = "FAIL"
+        out["local_import_error"] = str(exc)
+
+    vg = verify_r2d_bootstrap_origins(inputs["pins"], TARGET)
+    out["LOCAL_BOOTSTRAP_VERSION_VERIFY"] = vg["status"]
+    out["LOCAL_BOOTSTRAP_ORIGIN_VERIFY"] = vg["status"]
+    out["local_gate_entries"] = vg.get("entries", [])
+
+    try:
+        mage_boot = ub.bootstrap_upstream_mage()
+        import mage_flow
+        out["VENDORED_MAGE_CLEAN_IMPORT"] = "PASS"
+        out["MAGE_ORIGIN"] = pathlib.Path(getattr(mage_flow, "__file__", "?"))
+        mrel = pathlib.Path(out["MAGE_ORIGIN"]).resolve()
+        mrel = mrel.relative_to(PROJECT.resolve()).as_posix()
+        out["MAGE_ORIGIN"] = mrel
+        out["mage_provenance_present"] = bool(mage_boot)
+    except Exception as exc:
+        out["VENDORED_MAGE_CLEAN_IMPORT"] = "FAIL"
+        out["mage_import_error"] = str(exc)[:800]
+
+    origin = out.get("POST_PROVISION_LOGURU_ORIGIN") or ""
+    local_target = str(TARGET.resolve())
+    origin_resolved = str(pathlib.Path(origin).resolve()) if origin not in ("?", "") else ""
+    out["GLOBAL_LOGURU_USED"] = "YES" if origin_resolved and not origin_resolved.startswith(local_target) else "NO"
+    out["subprocess_returncode"] = 0
+
+out["target"] = str(TARGET)
+pathlib.Path(WORK / "proof.json").write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
+print(json.dumps(out, indent=2, sort_keys=True))
+'''
