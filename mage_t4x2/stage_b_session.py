@@ -895,3 +895,67 @@ class StageBSession:
                 failure_code="MISSING_PHASE_EVIDENCE",
                 details={"missing_evidence": sorted(missing)},
             )
+        if self.model_load_count != 1:
+            self._sm.fail(FAILED_G6)
+            return self._finalize_result(
+                None, "G6", 1, "FAIL",
+                failure_code="MULTIPLE_MODEL_LOADS",
+                details={"model_load_count": self.model_load_count},
+            )
+        self.finalized = True
+        self._sm.transition(FINALIZED)
+        return self._finalize_result(None, "G6", 0, "PASS")
+
+    # -- helpers ------------------------------------------------------------
+    def _assert_index(self) -> None:
+        if self.model_load_count > 1:
+            raise AuthorityViolation(
+                f"model_load_count={self.model_load_count}; authority allows exactly 1"
+            )
+        if self.state is not None:
+            n = getattr(self.state, "model_load_count", None)
+            if n is not None and n > 1:
+                raise AuthorityViolation(f"model_load_count={n}; authority allows exactly 1")
+
+    def _new_inference_id(self) -> str:
+        self.inference_id = f"t2i-{time.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+        return self.inference_id
+
+    def _record_device_map(self, phase: str, topology: str, profile: str, details: Optional[Dict[str, Any]] = None) -> None:
+        self.device_map_log[phase] = {
+            "topology": topology,
+            "profile": profile,
+            "state_id": id(self.state),
+            "phase_start": time.time(),
+        }
+        if details is not None:
+            self.device_map_log[phase]["details"] = details
+
+    def _precision_state(self, profile: str) -> None:
+        self.precision_progression.append(profile)
+        if profile in ("dual_t4_all_bf16",):
+            self._all_bf16_reached = True  # type: ignore[attr-defined]
+
+    # -- status output ------------------------------------------------------
+    def to_status(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "state": self.state_name,
+            "model_load_count": self.model_load_count,
+            "model_loaded": self.model_loaded,
+            "finalized": self.finalized,
+            "inference_id": self.inference_id,
+            "dual_forward_adapter_attached": self.dual_forward_adapter_attached,
+            "device_map_log": self.device_map_log,
+            "precision_progression": list(self.precision_progression),
+            "inference_calls": dict(self._inference_calls),
+            "results": {k: v.to_dict() for k, v in self.results.items()},
+        }
+
+    def save_status(self, path: str) -> str:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(
+            json.dumps(self.to_status(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return path
