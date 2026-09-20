@@ -1,0 +1,26 @@
+name: Question / Câu hỏi
+description: Ask about setup, behavior, or repository usage / Hỏi về setup, hành vi hoặc cách sử dụng
+title: "[Question]: "
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question / Câu hỏi
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Commit or version / Commit hoặc phiên bản
+  - type: textarea
+    id: context
+    attributes:
+      label: Context / Bối cảnh
+      description: Include Kaggle/local environment, accelerator and relevant commands. / Thêm môi trường Kaggle/local, accelerator và lệnh liên quan.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission check / Kiểm tra trước khi gửi
+      options:
+        - label: I checked README, docs and existing issues first. / Tôi đã kiểm tra README, docs và issue hiện có.
+          required: true
