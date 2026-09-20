@@ -481,3 +481,195 @@ def _check_no_network_in_args(argv: List[str]) -> None:
             NETWORK_PROVISIONING_BLOCKED,
             "pip install without --no-index detected",
         )
+
+
+def provision_bootstrap_dependencies_offline(
+    pins: List[BootstrapPin],
+    requirements_path: Optional[str] = None,
+    wheelhouse_dir: Optional[str] = None,
+    bootstrap_site: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Provision bootstrap dependencies from local wheelhouse only.
+
+    Uses pip with --no-index and --find-links to install into a project-local
+    bootstrap site directory.  Never uses the network.
+    """
+    if requirements_path is None:
+        req_path = str(_PROJECT_ROOT / DEFAULT_REQUIREMENTS_FILE)
+    else:
+        req_path = str(Path(requirements_path).resolve())
+
+    if wheelhouse_dir is None:
+        whl_dir = str(_PROJECT_ROOT / DEFAULT_WHEELHOUSE_DIR)
+    else:
+        whl_dir = str(Path(wheelhouse_dir).resolve())
+
+    if bootstrap_site is None:
+        site = str(_PROJECT_ROOT / DEFAULT_BOOTSTRAP_SITE)
+    else:
+        site = str(Path(bootstrap_site).resolve())
+
+    # Clean stale bootstrap site
+    site_path = Path(site)
+    if site_path.exists():
+        import shutil
+
+        shutil.rmtree(site)
+    site_path.mkdir(parents=True, exist_ok=True)
+
+    argv = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--no-index",
+        "--find-links",
+        whl_dir,
+        "--target",
+        site,
+        "--requirement",
+        req_path,
+        "--disable-pip-version-check",
+        "--no-input",
+    ]
+
+    _check_no_network_in_args(argv)
+
+    import time
+
+    start = time.monotonic()
+    result = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    duration = time.monotonic() - start
+
+    if result.returncode != 0:
+        raise BootstrapDependencyError(
+            BOOTSTRAP_PROVISION_FAILED,
+            f"pip install failed (rc={result.returncode}): {result.stderr[:500]}",
+        )
+
+    return {
+        "status": "PASS",
+        "argv": argv,
+        "return_code": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "duration_seconds": round(duration, 3),
+        "bootstrap_site": site,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Post-provision verification
+# ---------------------------------------------------------------------------
+
+
+def verify_bootstrap_dependencies(
+    pins: List[BootstrapPin],
+    bootstrap_site: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Verify after provisioning: exact version, importable, resolves from site.
+
+    Prepends the bootstrap site to sys.path, invalidates import caches, then
+    verifies each pin.
+    """
+    if bootstrap_site is None:
+        site = str(_PROJECT_ROOT / DEFAULT_BOOTSTRAP_SITE)
+    else:
+        site = str(Path(bootstrap_site).resolve())
+
+    site_path = Path(site)
+    if not site_path.is_dir():
+        return {
+            "status": "FAIL",
+            "error": f"bootstrap site missing: {site}",
+            "results": [],
+        }
+
+    # Prepend to sys.path and invalidate caches
+    if site not in sys.path:
+        sys.path.insert(0, site)
+    importlib.invalidate_caches()
+
+    results: List[Dict[str, Any]] = []
+    all_ok = True
+
+    for pin in pins:
+        entry: Dict[str, Any] = {
+            "distribution": pin.distribution,
+            "expected_version": pin.version,
+        }
+
+        # Check installed version via importlib.metadata
+        try:
+            installed_ver = importlib.metadata.version(pin.distribution)
+            entry["installed_version"] = installed_ver
+            entry["version_match"] = installed_ver == pin.version
+        except Exception as exc:
+            entry["installed_version"] = None
+            entry["version_match"] = False
+            entry["error"] = str(exc)
+            all_ok = False
+            results.append(entry)
+            continue
+
+        # Check importability
+        mod_name = pin.distribution.replace("-", "_").lower()
+        try:
+            mod = importlib.import_module(mod_name)
+            entry["importable"] = True
+            entry["module_file"] = getattr(mod, "__file__", None)
+        except Exception as exc:
+            entry["importable"] = False
+            entry["import_error"] = str(exc)
+            all_ok = False
+            results.append(entry)
+            continue
+
+        # Check resolves from bootstrap site
+        mod_file = getattr(mod, "__file__", None)
+        if mod_file:
+            resolves_from_site = str(Path(mod_file).resolve()).startswith(site)
+            entry["resolves_from_bootstrap_site"] = resolves_from_site
+            if not resolves_from_site:
+                all_ok = False
+        else:
+            entry["resolves_from_bootstrap_site"] = None
+
+        if not entry.get("version_match") or not entry.get("importable"):
+            all_ok = False
+
+        results.append(entry)
+
+    return {
+        "status": "PASS" if all_ok else "FAIL",
+        "bootstrap_site": site,
+        "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Network command rejection helper (for AST-level driver tests)
+# ---------------------------------------------------------------------------
+
+FORBIDDEN_COMMANDS = ("pip install", "pip download", "git clone", "curl", "wget")
+
+
+def reject_network_commands(source: str) -> List[str]:
+    """Return list of forbidden network-capable commands found in source text.
+
+    Used for static AST/string analysis of driver scripts.
+    """
+    violations: List[str] = []
+    for line_no, line in enumerate(source.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        for cmd in FORBIDDEN_COMMANDS:
+            if cmd in stripped and "--no-index" not in stripped:
+                violations.append(f"line {line_no}: {stripped!r} contains {cmd!r}")
+    return violations
