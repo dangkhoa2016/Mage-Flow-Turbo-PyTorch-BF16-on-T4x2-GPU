@@ -1,0 +1,6 @@
+# Mage-Flow-Turbo-PyTorch-BF16-T4x2 — R2C bootstrap dependency lock
+# Only lightweight dependencies required before mage_flow import.
+# Heavy pre-existing runtime deps (torch, transformers, diffusers, etc.)
+# are NOT included here — they are verified as importable at preflight.
+#
+loguru==0.7.3
