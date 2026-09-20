@@ -699,3 +699,58 @@ out["target"] = str(TARGET)
 pathlib.Path(WORK / "proof.json").write_text(json.dumps(out, indent=2, sort_keys=True) + "\n")
 print(json.dumps(out, indent=2, sort_keys=True))
 '''
+
+
+def run_r2d_clean_bootstrap_proof(
+    project_root: Any,
+    work_root: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Run the clean-room global-loguru masking proof in a fresh subprocess.
+
+    Global ``loguru`` is actually made unusable inside the subprocess by the
+    strict import guard; provisioning happens from the local wheelhouse into a
+    fresh temporary target; Mage is bootstrap-imported from vendor; and the
+    loaded ``loguru`` is proven to remain the local-target copy.
+
+    Returns a JSON-serializable dict with the machine facts of section 27/29.
+    """
+    root = Path(project_root).resolve()
+    if work_root is None:
+        work_root = Path(tempfile.mkdtemp(prefix="r2d-clean-proof-", dir="/tmp/opencode"))
+    else:
+        work_root = Path(work_root)
+        work_root.mkdir(parents=True, exist_ok=True)
+
+    snippet = _CLEAN_ROOM_PROOF_SNIPPET.format(project=str(root), work=str(work_root))
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", snippet],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(root),
+    )
+    proof_path = work_root / "proof.json"
+    proof: Dict[str, Any] = {}
+    if proof_path.is_file():
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    else:
+        proof = {"error": "proof subprocess produced no proof.json"}
+    proof["GLOBAL_LOGURU_MASK_ACTIVE"] = (
+        "PASS" if proof.get("PRE_PROVISION_LOGURU_IMPORT") == "FAIL_AS_EXPECTED" else "FAIL"
+    )
+    proof["subprocess_executable"] = sys.executable
+    proof["subprocess_isolation_flags"] = ["-I", "-c"]
+    proof["subprocess_returncode"] = proc.returncode
+    proof["stderr"] = proc.stderr.strip()[-2000:]
+
+    inputs = verify_r2d_bootstrap_inputs(
+        root / "requirements-bootstrap.lock",
+        root / "vendor" / "bootstrap-wheelhouse",
+        root / "vendor" / "bootstrap-wheelhouse-manifest.json",
+    )
+    proof.setdefault("wheelhouse_path", str(root / "vendor" / "bootstrap-wheelhouse"))
+    proof.setdefault("lock_sha256", inputs.get("lock_sha256"))
+    proof.setdefault("manifest_sha256", inputs.get("manifest_sha256"))
+    proof.setdefault("wheel_sha256", inputs.get("wheel_sha256"))
+    proof["recorded_at_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return proof
