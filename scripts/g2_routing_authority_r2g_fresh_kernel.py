@@ -1188,3 +1188,281 @@ def summary_provenance_map_r2c() -> Dict[str, Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# R2G human-summary provenance (runbook 2026-09-18, sections 34-36)
+# ---------------------------------------------------------------------------
+
+DIAGNOSTIC_NAME = "G2_ROUTING_AUTHORITY_R2G"
+
+HUMAN_SUMMARY_KEYS = [
+    "R2G_RUNTIME_BASELINE_INTEGRITY",
+    "BOOTSTRAP_REQUIREMENTS_LOCK",
+    "BOOTSTRAP_WHEELHOUSE_INTEGRITY",
+    "BOOTSTRAP_LOCAL_SITE_FRESH",
+    "BOOTSTRAP_LOCAL_PROVISION",
+    "BOOTSTRAP_LOCAL_VERSION_VERIFY",
+    "BOOTSTRAP_LOCAL_ORIGIN_VERIFY",
+    "UPSTREAM_BOOTSTRAP",
+    "P0",
+    "G0",
+    "L0",
+    "SDPA",
+    "G1",
+    "G2",
+    "MODEL_LOAD_COUNT",
+    "G1_INFERENCE_ID",
+    "G2_INFERENCE_ID",
+    "FINAL_VERDICT",
+]
+
+MACHINE_FACT_AUTHORITY_KEYS = list(HUMAN_SUMMARY_KEYS)
+
+
+def r2g_provenance_coverage() -> Dict[str, Any]:
+    """Exact-set coverage of R2G machine-fact authority keys vs human summary.
+
+    Every human-summary line must map to exactly one machine-fact key and vice
+    versa (no missing, no extra, exact equality).  This mirrors the runbook
+    summary-provenance requirement for the R2G diagnostic.
+    """
+    human = set(HUMAN_SUMMARY_KEYS)
+    machine = set(MACHINE_FACT_AUTHORITY_KEYS)
+    return {
+        "equal": human == machine,
+        "missing": sorted(human - machine),
+        "extra": sorted(machine - human),
+    }
+
+
+def render_human_summary(machine: Dict[str, Any]) -> Dict[str, Any]:
+    """Render the R2G human-summary lines from the machine-fact dict.
+
+    Fail-closed: any missing or empty machine fact renders ``FAIL``, never a
+    blank pass.  FINAL_VERDICT is PASS only when every R2G authority gate fact
+    is exactly PASS.
+    """
+    rendered: Dict[str, Any] = {}
+    for key in HUMAN_SUMMARY_KEYS:
+        value = machine.get(key)
+        rendered[key] = value if value not in (None, "") else "FAIL"
+    gates = [
+        "R2G_RUNTIME_BASELINE_INTEGRITY",
+        "BOOTSTRAP_REQUIREMENTS_LOCK",
+        "BOOTSTRAP_WHEELHOUSE_INTEGRITY",
+        "BOOTSTRAP_LOCAL_SITE_FRESH",
+        "BOOTSTRAP_LOCAL_PROVISION",
+        "BOOTSTRAP_LOCAL_VERSION_VERIFY",
+        "BOOTSTRAP_LOCAL_ORIGIN_VERIFY",
+        "UPSTREAM_BOOTSTRAP",
+        "P0",
+        "G0",
+        "L0",
+        "SDPA",
+        "G1",
+        "G2",
+    ]
+    complete = set(HUMAN_SUMMARY_KEYS) <= set(machine)
+    all_pass = all(str(machine.get(g, "")).upper() == "PASS" for g in gates)
+    rendered["FINAL_VERDICT"] = "PASS" if (complete and all_pass) else "FAIL"
+    return rendered
+
+
+# ---------------------------------------------------------------------------
+# Block routing adjudication (kept for the BLOCK_ROUTING gate only)
+# ---------------------------------------------------------------------------
+
+
+def adjudicate_block_routing(
+    observed_blocks: Dict[int, str],
+    plan_blocks: Dict[int, str],
+    num_blocks_live: int,
+) -> Dict[str, Any]:
+    """BLOCK_ROUTING gate over the COMPLETE block-index -> device mapping.
+
+    PASS requires both:
+      1. the observed block index set covers exactly ``[0, num_blocks_live)``;
+      2. the full ``{index: device}`` mapping equals the L0 memory-aware plan.
+    """
+    order_valid = (
+        sorted(observed_blocks) == list(range(num_blocks_live))
+        and len(observed_blocks) == num_blocks_live
+    )
+    mapping_equal = set(observed_blocks.items()) == set(plan_blocks.items())
+    ok = bool(order_valid and mapping_equal)
+    mismatches: List[Dict[str, Any]] = []
+    for idx in sorted(set(observed_blocks) | set(plan_blocks)):
+        obs = observed_blocks.get(idx)
+        plan = plan_blocks.get(idx)
+        if str(obs) != str(plan):
+            mismatches.append({"block": idx, "observed": obs, "planned": plan})
+    return {
+        "pass": ok,
+        "order_valid": bool(order_valid),
+        "mapping_equal": bool(mapping_equal),
+        "observed": {int(k): str(v) for k, v in observed_blocks.items()},
+        "planned": {int(k): str(v) for k, v in plan_blocks.items()},
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches,
+    }
+
+
+def phase_block_integrity(facts: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Surface the ALREADY-derived phase block-integrity facts."""
+    f = facts or {}
+    return {
+        "block_order_valid": bool(f.get("BLOCK_ORDER_VALID")),
+        "no_duplicated_blocks": bool(f.get("NO_DUPLICATED_BLOCKS")),
+        "no_skipped_blocks": bool(f.get("NO_SKIPPED_BLOCKS")),
+        "cross_inference_clean": bool(f.get("CROSS_INFERENCE_CLEAN")),
+        "gpu0_participation": bool(f.get("GPU0_PARTICIPATION")),
+        "gpu1_participation": bool(f.get("GPU1_PARTICIPATION")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gate implementations
+# ---------------------------------------------------------------------------
+
+
+class R2GDriver:
+    """Collects gate results and machine-readable summary fields for R2G."""
+
+    def __init__(self, evidence_root: Path) -> None:
+        self.evidence_root = evidence_root
+        self.session: Any = None
+        self.summary: Dict[str, Any] = {
+            "diagnostic_name": "G2_ROUTING_AUTHORITY_R2G",
+            "evidence_root": str(evidence_root),
+            "status": "NOT_RUN",
+            "first_failed_gate": None,
+            "failure_code": None,
+            "error": None,
+            "exception_type": None,
+            "exception_message": None,
+            "session_id": None,
+            "session_state": None,
+            "bootstrap_requirements": None,
+            "bootstrap_requirements_sha256": None,
+            "bootstrap_wheelhouse_manifest_sha256": None,
+            "bootstrap_wheelhouse_artifacts": None,
+            "bootstrap_dependency_states_before": None,
+            "bootstrap_dependency_states_after": None,
+            "bootstrap_site": None,
+            "bootstrap_pip_result": None,
+            "bootstrap_requirements_lock_gate": None,
+            "bootstrap_wheelhouse_integrity_gate": None,
+            "bootstrap_dependency_preflight_gate": None,
+            "bootstrap_dependency_provisioning_gate": None,
+            "bootstrap_dependency_postverify_gate": None,
+            "p0_status": None,
+            "g0_hardware_status": None,
+            "g0_session_status": None,
+            "g0_status": None,
+            "model_load_count": None,
+            "split_block": None,
+            "num_blocks": None,
+            "expected_transformer_invocations": None,
+            "runtime_state_id": None,
+            "transformer_id": None,
+            "text_encoder_id": None,
+            "vae_id": None,
+            "g1_inference_id": None,
+            "g1_output_path": None,
+            "g1_evidence_paths": None,
+            "g1_status": None,
+            "g2_inference_id": None,
+            "g2_output_path": None,
+            "g2_evidence_paths": None,
+            "g2_status": None,
+            "runtime_state_id_stable": False,
+            "transformer_id_stable": False,
+            "text_encoder_id_stable": False,
+            "vae_id_stable": False,
+            "g2_block_order_valid": False,
+            "g2_no_skipped_blocks": False,
+            "g2_no_duplicated_blocks": False,
+            "g2_cross_inference_clean": False,
+            "g2_gpu0_participation": False,
+            "g2_gpu1_participation": False,
+            "g2_transfer_0_to_1_event_count": None,
+            "g2_transfer_0_to_1_expected_count": None,
+            "g2_transfer_0_to_1_valid": False,
+            "g2_transformer_return_event_count": None,
+            "g2_transformer_return_expected_count": None,
+            "g2_transformer_return_valid": False,
+            "post_head_device_expected": None,
+            "post_head_device_observed": None,
+            "post_head_device_valid": False,
+            "vae_device_expected": None,
+            "g2_vae_input_transfer_event_count": None,
+            "g2_vae_input_transfer_expected_count": None,
+            "g2_vae_input_transfer_valid": False,
+            "cpu_fallback_config_observed_value": None,
+            "cpu_fallback_forbidden_config": False,
+            "no_cpu_fallback_observed": False,
+            "g2_no_nan": None,
+            "g2_no_inf": None,
+            "g2_output_valid": False,
+            "g3_g6_executed": False,
+        }
+        self.gates: List[Dict[str, Any]] = []
+        import torch
+
+        self.summary["torch_version"] = torch.__version__
+        self.summary["cuda_available"] = bool(torch.cuda.is_available())
+        self.summary["gpu_count"] = (
+            int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+        )
+
+    def record_gate(self, name: str, ok: bool, detail: Any = None) -> None:
+        entry: Dict[str, Any] = {"gate": name, "status": "PASS" if ok else "FAIL"}
+        if detail is not None:
+            entry["detail"] = detail
+        self.gates.append(entry)
+        self.summary["gates"] = self.gates
+        print(f"[GATE] {name}={entry['status']}")
+
+    def require(self, name: str, condition: bool, message: str) -> None:
+        self.record_gate(name, condition, message)
+        if not condition:
+            self.summary["status"] = "FAIL"
+            self.summary["first_failed_gate"] = name
+            self.summary["failure_code"] = "AUTHORITY_GATE_FAILED"
+            self.summary["error"] = message
+            raise AuthorityGateFailure(name, message)
+
+    # -- failure-evidence collection (best-effort, NEVER runs inference) -----
+
+    def _existing_phase_evidence(self, phase: str) -> Dict[str, Any]:
+        """Already-existing evidence only; never triggers a new inference."""
+        key_map = {
+            "G1": ("g1_inference_id", "g1_output_path", "g1_evidence_paths", "g1_status"),
+            "G2": ("g2_inference_id", "g2_output_path", "g2_evidence_paths", "g2_status"),
+        }
+        id_k, op_k, ep_k, st_k = key_map.get(phase, (None, None, None, None))
+        if id_k and self.summary.get(ep_k):
+            return {
+                "inference_id": self.summary.get(id_k),
+                "output_path": self.summary.get(op_k),
+                "evidence_paths": self.summary.get(ep_k) or {},
+                "status": self.summary.get(st_k),
+                "telemetry_path": (self.summary.get(ep_k) or {}).get("telemetry"),
+            }
+        result = None
+        if self.session is not None:
+            try:
+                result = self.session.results.get(phase)
+            except Exception:
+                result = None
+        if result is None:
+            return {}
+        paths = result.evidence_paths or {}
+        return {
+            "inference_id": result.inference_id,
+            "output_path": result.output_path,
+            "evidence_paths": paths,
+            "status": result.status,
+            "telemetry_path": paths.get("telemetry"),
+        }
+
+    def collect_failure_evidence(self, exc: Exception) -> None:
+        """Preserve rich machine-readable evidence on EVERY failure."""
