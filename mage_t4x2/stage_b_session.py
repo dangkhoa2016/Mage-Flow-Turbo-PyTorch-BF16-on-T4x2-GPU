@@ -596,3 +596,302 @@ class StageBSession:
             return False
         return True
 
+    def _classify_failure(self, exc: Exception) -> str:
+        msg = f"{type(exc).__name__}: {exc}"
+        if "INFERENCE_NOT_EXECUTED" in msg:
+            return "INFERENCE_NOT_EXECUTED"
+        if "ADAPTER_DOUBLE_ATTACH" in msg or "double attach" in msg.lower():
+            return "ADAPTER_DOUBLE_ATTACH"
+        if "DUAL_FORWARD_ADAPTER_MISSING" in msg:
+            return "DUAL_FORWARD_ADAPTER_MISSING"
+        if "TRANSFORMER_POST_DEVICE_MISMATCH" in msg:
+            return "TRANSFORMER_POST_DEVICE_MISMATCH"
+        if "REPLAY_PROFILE_DRIFT" in msg:
+            return "REPLAY_PROFILE_DRIFT"
+        if "REPLAY_TOPOLOGY_DRIFT" in msg:
+            return "REPLAY_TOPOLOGY_DRIFT"
+        return "INFERENCE_RUNTIME_FAILURE"
+
+    def _write_phase_evidence(self, ctx: PhaseContext, result: Dict[str, Any], observed: Dict[str, Any], acceptance: Dict[str, Any]) -> None:
+        from .evidence import write_json_doc
+
+        run = ctx.evidence_run
+        run.write_run_contract(self.contract.to_dict())
+        run.write_acceptance(acceptance)
+        write_json_doc(str(Path(ctx.run_dir) / "observed-facts.json"), observed)
+        out_png = result.get("output_png")
+        if out_png:
+            run.copy_output_image(out_png)
+
+    def _replay_evidence(self, phase: str, ctx: PhaseContext, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if phase != "G5":
+            return None
+        g4 = self._g4_replay_record or {}
+        profile = getattr(self.state, "current_profile", None)
+        topology = getattr(self.state, "current_topology", None)
+        return {
+            "g4_inference_id": g4.get("inference_id"),
+            "g5_inference_id": ctx.inference_id,
+            "g4_output_path": g4.get("output_path"),
+            "g5_output_path": result.get("output_png"),
+            "g4_profile": g4.get("profile"),
+            "g5_profile": profile,
+            "g4_topology": g4.get("topology"),
+            "g5_topology": topology,
+            "replay_executed": bool(result and result.get("output_png")),
+        }
+
+    def _record_replay_state(self, phase: str, ctx: PhaseContext, result: Dict[str, Any]) -> None:
+        if phase == "G4":
+            self._g4_replay_record = {
+                "inference_id": ctx.inference_id,
+                "output_path": result.get("output_png"),
+                "profile": getattr(self.state, "current_profile", None),
+                "topology": getattr(self.state, "current_topology", None),
+            }
+            self._last_dual_plan = {"transformer": {"blocks": dict(self._current_block_devices)}}
+
+    # -- result assembly ---------------------------------------------------
+    def _pass_result(
+        self,
+        ctx: PhaseContext,
+        phase: str,
+        observed: Optional[Dict[str, Any]] = None,
+        acceptance: Optional[Dict[str, Any]] = None,
+        output_path: Optional[str] = None,
+        inference_call_count: Optional[int] = None,
+    ) -> PhaseResult:
+        return self._finalize_result(
+            ctx, phase, 0, "PASS",
+            observed=observed,
+            acceptance=acceptance,
+            output_path=output_path,
+            inference_call_count=inference_call_count,
+        )
+
+    def _fail_result(
+        self,
+        ctx: Optional[PhaseContext],
+        phase: str,
+        failure_code: str,
+        observed: Optional[Dict[str, Any]] = None,
+        acceptance: Optional[Dict[str, Any]] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> PhaseResult:
+        return self._finalize_result(
+            ctx, phase, 1, "FAIL",
+            observed=observed,
+            acceptance=acceptance,
+            failure_code=failure_code,
+            details=details,
+        )
+
+    def _finalize_result(
+        self,
+        ctx: Optional[PhaseContext],
+        phase: str,
+        exit_code: int,
+        status: str,
+        observed: Optional[Dict[str, Any]] = None,
+        acceptance: Optional[Dict[str, Any]] = None,
+        output_path: Optional[str] = None,
+        failure_code: Optional[str] = None,
+        inference_call_count: Optional[int] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> PhaseResult:
+        inference_id = ctx.inference_id if ctx is not None else self.inference_id or "n/a"
+        result = PhaseResult(
+            phase=phase,
+            run_id=self.session_id,
+            inference_id=inference_id,
+            exit_code=exit_code,
+            status=status,
+            model_load_count=self.model_load_count if self.model_loaded else None,
+            runtime_state_id=str(id(self.state)) if self.state is not None else None,
+            inference_call_count=inference_call_count if inference_call_count is not None else self._inference_calls.get(phase, 0),
+            output_path=output_path,
+            acceptance=acceptance,
+            observed_facts=observed,
+            evidence_paths={
+                "phase_result": str(Path(self.evidence_root) / phase / "phase-result.json") if ctx is not None else None,
+                "telemetry": ctx.telemetry_path if ctx is not None else None,
+                "acceptance": str(Path(self.evidence_root) / phase / "acceptance.json") if ctx is not None else None,
+                "observed_facts": str(Path(self.evidence_root) / phase / "observed-facts.json") if ctx is not None else None,
+                "output_png": str(Path(self.evidence_root) / phase / "output.png") if ctx is not None else None,
+            },
+            failure_code=failure_code,
+            details=details,
+        )
+        self.results[phase] = result
+        if ctx is not None:
+            result.save(str(Path(ctx.run_dir) / "phase-result.json"))
+        return result
+
+    # -- G0 preflight -------------------------------------------------------
+    def run_g0_preflight(self) -> PhaseResult:
+        if self._sm.name != CREATED:
+            raise AuthorityStateError(
+                f"G0 must be first; current state {self._sm.name!r}"
+            )
+        try:
+            backend = self._backend()
+            inventory = self._call(backend, "preflight_gpu")
+            self._sm.transition(G0_PASS)
+            return self._finalize_result(None, "G0", 0, "PASS", details={"inventory": inventory})
+        except Exception as exc:
+            self._sm.fail(FAILED_G0)
+            return self._finalize_result(
+                None, "G0", 1, "FAIL",
+                failure_code="PREFLIGHT_FAILURE",
+                details={"error": str(exc)},
+            )
+
+    # -- G1 dual-T4 mixed baseline ------------------------------------------
+    def run_g1_baseline(self) -> PhaseResult:
+        return self.run_g1_dual_t4_mixed()
+
+    def run_g1_dual_t4_mixed(self, num_blocks: Optional[int] = None, split_block: Optional[int] = None) -> PhaseResult:
+        if self.state is None:
+            raise AuthorityStateError("G1 requires model load first (load_once)")
+        if self._sm.name != L0_SPREAD_LOAD_PASS:
+            raise AuthorityStateError(
+                f"G1 requires L0_SPREAD_LOAD_PASS; current state {self._sm.name!r}"
+            )
+        num_blocks, memory_split = self._memory_plan_params()
+        split_block = split_block if split_block is not None else self._l0_split_block
+        if num_blocks is None:
+            raise AuthorityStateError("G1 requires a num_blocks value or an L0 memory plan")
+        return self._execute_phase(
+            "G1", G1_PASS, FAILED_G1,
+            config_fn=self._configure_dual_t4_mixed(num_blocks, split_block),
+            require_dual_adapter=True,
+        )
+
+    def _configure_dual_t4_mixed(self, num_blocks: int, split_block: Optional[int]):
+        def _config(ctx: PhaseContext, backend: Any) -> Dict[str, Any]:
+            applied = self._call(backend, "apply_dual_t4_mixed", self.state, num_blocks, split_block)
+            applied["phase"] = ctx.phase
+            self._record_device_map(ctx.phase, "dual_t4", "mixed", details=applied)
+            return applied
+        return _config
+
+    # -- G2 dual-T4 mixed routing -------------------------------------------
+    def run_g2_dual_t4_mixed(self, num_blocks: Optional[int] = None, split_block: Optional[int] = None) -> PhaseResult:
+        if self._sm.name != G1_PASS:
+            raise AuthorityStateError(f"G2 requires G1_PASS; current state {self._sm.name!r}")
+        num_blocks, _ = self._memory_plan_params()
+        split_block = split_block if split_block is not None else self._l0_split_block
+        if num_blocks is None:
+            raise AuthorityStateError("G2 requires a num_blocks value or an L0 memory plan")
+        return self._execute_phase(
+            "G2", G2_PASS, FAILED_G2,
+            config_fn=self._configure_dual_t4_mixed(num_blocks, split_block),
+            require_dual_adapter=True,
+        )
+
+    # -- G3 dual-T4 all-BF16 ------------------------------------------------
+    def run_g3_dual_t4_all_bf16(self, num_blocks: Optional[int] = None, split_block: Optional[int] = None) -> PhaseResult:
+        if self._sm.name != G2_PASS:
+            raise AuthorityStateError(f"G3 requires G2_PASS; current state {self._sm.name!r}")
+        num_blocks, _ = self._memory_plan_params()
+        split_block = split_block if split_block is not None else self._l0_split_block
+        if num_blocks is None:
+            raise AuthorityStateError("G3 requires a num_blocks value or an L0 memory plan")
+        return self._execute_phase(
+            "G3", G3_PASS, FAILED_G3,
+            config_fn=self._configure_dual_t4_all_bf16(num_blocks, split_block),
+            require_dual_adapter=True,
+        )
+
+    # -- G4 dual-T4 all-BF16 -----------------------------------------------
+    def run_g4_dual_t4_all_bf16(self, num_blocks: Optional[int] = None, split_block: Optional[int] = None) -> PhaseResult:
+        if self._sm.name != G3_PASS:
+            raise AuthorityStateError(f"G4 requires G3_PASS; current state {self._sm.name!r}")
+        for gate_phase in ("G2", "G3"):
+            prev = self.results.get(
+                gate_phase, PhaseResult(gate_phase, "", "", 1, "FAIL")
+            )
+            if prev.status != "PASS":
+                raise AuthorityStateError(f"G4 requires {gate_phase} PASS (found {prev.status})")
+        num_blocks, _ = self._memory_plan_params()
+        split_block = split_block if split_block is not None else self._l0_split_block
+        if num_blocks is None:
+            raise AuthorityStateError("G4 requires a num_blocks value or an L0 memory plan")
+        return self._execute_phase(
+            "G4", G4_PASS, FAILED_G4,
+            config_fn=self._configure_dual_t4_all_bf16(num_blocks, split_block),
+            require_dual_adapter=True,
+        )
+
+    def _configure_dual_t4_all_bf16(self, num_blocks: int, split_block: Optional[int]):
+        def _config(ctx: PhaseContext, backend: Any) -> Dict[str, Any]:
+            applied = self._call(backend, "apply_dual_t4_all_bf16", self.state, num_blocks, split_block)
+            applied["phase"] = ctx.phase
+            self._record_device_map(ctx.phase, "dual_t4", "all_bf16", details=applied)
+            self._precision_state("dual_t4_all_bf16")
+            return applied
+        return _config
+
+    # -- G5 replay ----------------------------------------------------------
+    def run_g5_replay(self) -> PhaseResult:
+        if self._sm.name != G4_PASS:
+            raise AuthorityStateError(f"G5 requires G4_PASS; current state {self._sm.name!r}")
+        return self._execute_phase(
+            "G5", G5_PASS, FAILED_G5,
+            config_fn=self._configure_replay,
+            require_dual_adapter=True,
+            replay=True,
+        )
+
+    def _configure_replay(self, ctx: PhaseContext, backend: Any) -> Dict[str, Any]:
+        profile = getattr(self.state, "current_profile", None)
+        topology = getattr(self.state, "current_topology", None)
+        g4 = self._g4_replay_record or {}
+        if g4.get("profile") is not None and profile != g4.get("profile"):
+            raise RuntimeError("REPLAY_PROFILE_DRIFT: replay precision profile drifted from G4 final profile")
+        if g4.get("topology") is not None and topology != g4.get("topology"):
+            raise RuntimeError("REPLAY_TOPOLOGY_DRIFT: replay topology drifted from G4 final topology")
+        plan = self._last_dual_plan or {"transformer": {"blocks": dict(self._current_block_devices)}}
+        self._record_device_map("g5", topology, profile, details={"replay": True})
+        return {"device_plan": plan}
+
+    # -- G6 finalize ---------------------------------------------------------
+    def run_g6_finalize(self) -> PhaseResult:
+        if self._sm.name != G5_PASS:
+            raise AuthorityStateError(f"G6 requires G5_PASS; current state {self._sm.name!r}")
+        required_files = {
+            "L0": ("phase-result.json", "acceptance.json", "observed-facts.json", "memory-plan.json", "placement-validation.json"),
+            "G1": ("phase-result.json", "telemetry.jsonl", "acceptance.json", "observed-facts.json", "output.png"),
+            "G2": ("phase-result.json", "telemetry.jsonl", "acceptance.json", "observed-facts.json", "output.png"),
+            "G3": ("phase-result.json", "telemetry.jsonl", "acceptance.json", "observed-facts.json", "output.png"),
+            "G4": ("phase-result.json", "telemetry.jsonl", "acceptance.json", "observed-facts.json", "output.png"),
+            "G5": ("phase-result.json", "telemetry.jsonl", "acceptance.json", "observed-facts.json", "output.png"),
+        }
+        missing = []
+        for phase in ("L0", "G1", "G2", "G3", "G4", "G5"):
+            prev = self.results.get(phase)
+            if prev is None or prev.status != "PASS":
+                self._sm.fail(FAILED_G6)
+                return self._finalize_result(
+                    None, "G6", 1, "FAIL",
+                    failure_code="PHASE_ACCEPTANCE_FAILED",
+                    details={"missing_phase": phase, "phase_status": prev.status if prev else "NOT_RUN"},
+                )
+            if prev.acceptance is None or prev.acceptance.get("provisional"):
+                self._sm.fail(FAILED_G6)
+                return self._finalize_result(
+                    None, "G6", 1, "FAIL",
+                    failure_code="PHASE_ACCEPTANCE_FAILED",
+                    details={"phase": phase, "reason": "provisional acceptance"},
+                )
+            phase_dir = Path(self.evidence_root) / phase
+            for fname in required_files[phase]:
+                if not (phase_dir / fname).is_file():
+                    missing.append(f"{phase}/{fname}")
+        if missing:
+            self._sm.fail(FAILED_G6)
+            return self._finalize_result(
+                None, "G6", 1, "FAIL",
+                failure_code="MISSING_PHASE_EVIDENCE",
+                details={"missing_evidence": sorted(missing)},
+            )
