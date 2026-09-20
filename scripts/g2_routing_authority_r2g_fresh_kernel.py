@@ -1765,3 +1765,302 @@ class R2GDriver:
         self.summary["latent_anchor_plan_fallback"] = plan_latent
         plan_post = derive_post_head_device_expected_r2b(memory_plan, None)
         post_head_expected_g1 = plan_post["expected"]
+        self.summary["post_head_plan_fallback"] = plan_post
+
+        spread = len(set(plan_blocks.values())) == 2
+        self.require(
+            "L0",
+            (
+                (l0 is not None and l0.status == "PASS")
+                and session.model_load_count == 1
+                and memory_plan.get("status") == "PASS"
+                and (memory_plan.get("single_device") or {}).get("status") == "FAIL"
+                and bool(l0_facts.get("NO_FULL_MODEL_CUDA0_MATERIALIZATION"))
+                and bool(l0_facts.get("SPREAD_LOAD_PLAN_PASS"))
+                and bool(l0_facts.get("SPREAD_LOAD_OBSERVED_PLACEMENT_PASS"))
+                and spread
+                and memory_plan.get("split_policy") == "memory_aware"
+            ),
+            "L0 dual-T4 spread load acceptance failed",
+        )
+        print(
+            "L0=PASS split_block=%s num_blocks=%s no_full_cuda0=%s"
+            % (
+                split_block,
+                num_blocks_live,
+                bool(l0_facts.get("NO_FULL_MODEL_CUDA0_MATERIALIZATION")),
+            )
+        )
+        _write_json(
+            Path(evidence_root) / "l0-adjudication.json",
+            {
+                "l0_status": l0.status,
+                "model_load_count": session.model_load_count,
+                "memory_plan_status": memory_plan.get("status"),
+                "single_device_status": (memory_plan.get("single_device") or {}).get("status"),
+                "no_full_model_cuda0_materialization": bool(
+                    l0_facts.get("NO_FULL_MODEL_CUDA0_MATERIALIZATION")
+                ),
+                "split_block": split_block,
+                "split_policy": memory_plan.get("split_policy"),
+                "num_blocks_live": num_blocks_live,
+                "plan_blocks": plan_blocks,
+                "placement_status": placement.get("status"),
+                "vae_device_expected": actual_vae_device,
+                "cross_transfer_boundary_from_block": boundary["from_block"],
+                "cross_transfer_boundary_to_block": boundary["to_block"],
+                "cross_transfer_expected_from": cross_from,
+                "cross_transfer_expected_to": cross_to,
+            },
+        )
+
+        # --- SDPA gate ------------------------------------------------------
+        sdpa = assert_sdpa_frozen()
+        self.summary["sdpa"] = sdpa
+        self.require(
+            "SDPA",
+            sdpa.get("status") == "PASS"
+            and str(os.environ.get("VF_HF_ATTN_IMPL", "")).lower() == "sdpa",
+            f"SDPA not provable: {sdpa}",
+        )
+        sdpa_backend = (sdpa.get("backend") or {}).get("backend")
+        print("SDPA=PASS backend=%s" % sdpa_backend)
+
+        # --- Identity capture (pre-G1) --------------------------------------
+        identity_before = {
+            "runtime_state": id(session.state),
+            "model": id(session.state.model),
+            "transformer": id(session.state.transformer),
+            "text_encoder": id(session.state.text_encoder),
+            "vae": id(session.state.vae),
+        }
+        param_sample_before = {
+            "text_encoder": _first_param_ids(session.state.text_encoder),
+            "vae": _first_param_ids(session.state.vae),
+            "transformer_block0": _first_param_ids(blocks_live[0]),
+            "transformer_img_in": _first_param_ids(
+                getattr(session.state.transformer, "img_in", None)
+            ),
+        }
+
+        # ==================================================================
+        # G1: exactly one prerequisite dual-T4 mixed inference
+        # ==================================================================
+        g1 = session.run_g1_baseline()
+        self.summary["g1_inference_id"] = g1.inference_id
+        self.summary["g1_output_path"] = g1.output_path
+        self.summary["g1_evidence_paths"] = g1.evidence_paths or {}
+        self.summary["g1_status"] = g1.status
+        self.summary["session_state"] = session.state_name
+        self.require(
+            "G1_PREREQUISITE",
+            g1.status == "PASS"
+            and g1.exit_code == 0
+            and g1.output_path is not None
+            and g1.observed_facts is not None,
+            f"G1 prerequisite failed: {g1.failure_code}",
+        )
+        print("G1_OK inference_id=%s output=%s" % (g1.inference_id, g1.output_path))
+
+        # --- Post-G1 identity check ----------------------------------------
+        identity_after_g1 = {
+            "runtime_state": id(session.state),
+            "model": id(session.state.model),
+            "transformer": id(session.state.transformer),
+            "text_encoder": id(session.state.text_encoder),
+            "vae": id(session.state.vae),
+        }
+        param_sample_after_g1 = {
+            "text_encoder": _first_param_ids(session.state.text_encoder),
+            "vae": _first_param_ids(session.state.vae),
+            "transformer_block0": _first_param_ids(blocks_live[0]),
+            "transformer_img_in": _first_param_ids(
+                getattr(session.state.transformer, "img_in", None)
+            ),
+        }
+        g1_identity_preserved = (
+            identity_after_g1 == identity_before
+            and param_sample_after_g1 == param_sample_before
+            and session.model_load_count == 1
+        )
+        self.require(
+            "IDENTITY_PRESERVED_G1",
+            g1_identity_preserved,
+            "post-G1 object identity drift",
+        )
+        print("IDENTITY_G1=PASS model_load_count=%s" % session.model_load_count)
+
+        # --- G1 routing telemetry adjudication -------------------------------
+        g1_telemetry_path = Path(g1.evidence_paths.get("telemetry") or "")
+        _require(g1_telemetry_path.is_file(), "G1_TELEMETRY", f"missing: {g1_telemetry_path}")
+        g1_telemetry = parse_telemetry(str(g1_telemetry_path))
+
+        g1_blocked = _records_for(g1_telemetry, session.session_id, g1.inference_id, "block_forward")
+        g1_cross_events = _records_for(g1_telemetry, session.session_id, g1.inference_id, "cross_device_transfer")
+        g1_return_events = _records_for(g1_telemetry, session.session_id, g1.inference_id, "transformer_output_return_transfer")
+        g1_vae_events = _records_for(g1_telemetry, session.session_id, g1.inference_id, "vae_input_transfer")
+
+        g1_observed_blocks: Dict[int, str] = {}
+        for ev in g1_blocked:
+            g1_observed_blocks[int(ev.get("block"))] = str(ev.get("device"))
+        g1_routing = adjudicate_block_routing(g1_observed_blocks, plan_blocks, num_blocks_live)
+        self.require("G1_BLOCK_ROUTING", g1_routing["pass"], "G1 block routing mismatch")
+        g1_cross_adj = adjudicate_transfer_cardinality(
+            g1_cross_events,
+            from_device=cross_from,
+            to_device=cross_to,
+            expected_count=int(contract.steps),
+        )
+        self.require(
+            "G1_CROSS_TRANSFER",
+            g1_cross_adj["pass"],
+            "G1 cross_device_transfer cardinality invalid",
+        )
+        g1_post_head_adj = adjudicate_post_head_device(
+            g1_return_events,
+            expected_device=post_head_expected_g1,
+            expected_count=int(contract.steps),
+            anchor_device=latent_anchor_g1,
+        )
+        self.require(
+            "G1_TRANSFORMER_RETURN",
+            g1_post_head_adj["pass"],
+            "G1 transformer return/post-head witness invalid",
+        )
+        g1_vae_adj = adjudicate_transfer_cardinality(
+            g1_vae_events,
+            from_device=latent_anchor_g1,
+            to_device=actual_vae_device,
+            expected_count=1,
+        )
+        self.require(
+            "G1_VAE_INPUT_TRANSFER",
+            g1_vae_adj["pass"],
+            "G1 VAE input transfer invalid",
+        )
+
+        g1_integrity = phase_block_integrity(g1.observed_facts)
+        self.require(
+            "G1_ACCEPTANCE",
+            g1_integrity["block_order_valid"]
+            and g1_integrity["gpu0_participation"]
+            and g1_integrity["gpu1_participation"],
+            "G1 acceptance failed",
+        )
+        print("G1_ADJUDICATION=PASS")
+
+        # ==================================================================
+        # G2: routing authority
+        # ==================================================================
+        g2 = session.run_g2_dual_t4_mixed()
+        self.summary["g2_inference_id"] = g2.inference_id
+        self.summary["g2_output_path"] = g2.output_path
+        self.summary["g2_evidence_paths"] = g2.evidence_paths or {}
+        self.summary["g2_status"] = g2.status
+        self.summary["session_state"] = session.state_name
+        self.require(
+            "G2_ROUTING_AUTHORITY",
+            g2.status == "PASS"
+            and g2.exit_code == 0
+            and g2.output_path is not None
+            and g2.observed_facts is not None,
+            f"G2 routing authority failed: {g2.failure_code}",
+        )
+        print("G2_OK inference_id=%s output=%s" % (g2.inference_id, g2.output_path))
+
+        # --- R2A sec 17.1/17.3/17.7/17.8: capture LIVE authority placements --
+        live_placements = collect_live_authority_placements(session.state)
+        self.summary["live_authority_placements"] = live_placements
+        live_adj = adjudicate_live_authority_placements(live_placements)
+        self.summary["live_placement_adjudication"] = live_adj
+        self.require(
+            "LIVE_PLACEMENT",
+            live_adj["pass"],
+            "live authority placement not CUDA-only",
+        )
+        pv_observed = collect_observed_placement_validation(placement)
+        self.summary["placement_validation_observed"] = pv_observed
+        self.require(
+            "PLACEMENT_VALIDATION",
+            pv_observed["pass"],
+            "observed placement-validation not PASS/CUDA",
+        )
+        live_vs_plan = derive_live_vs_plan_placement_match(live_placements, memory_plan)
+        self.summary["live_vs_plan_placement_match"] = live_vs_plan
+        self.require(
+            "LIVE_VS_PLAN",
+            live_vs_plan["match"],
+            "live placement disagrees with the L0 plan",
+        )
+        latent = derive_latent_anchor_device_r2b(live_placements, memory_plan)
+        latent_anchor = latent["anchor_device"]
+        self.summary["latent_anchor_device_expected"] = latent_anchor
+        self.summary["latent_anchor_device_source"] = latent["source"]
+        self.require(
+            "LATENT_ANCHOR_DEVICE",
+            not latent["unproven"],
+            latent["reason"] or "latent anchor unproven",
+        )
+        post_derivation = derive_post_head_device_expected_r2b(
+            memory_plan, live_placements.get("transformer_post")
+        )
+        post_head_expected = post_derivation["expected"]
+        self.summary["post_head_expected_cross_check"] = post_derivation
+        self.summary["post_head_device_expected"] = post_head_expected
+        self.require(
+            "POST_HEAD_EXPECTED",
+            post_derivation["valid"],
+            post_derivation["reason"] or "post/head expected invalid",
+        )
+        print(
+            "LIVE_PLACEMENT=PASS latent_anchor=%s post_head_expected=%s"
+            % (latent_anchor, post_head_expected)
+        )
+
+        # --- Post-G2 identity check ----------------------------------------
+        identity_after_g2 = {
+            "runtime_state": id(session.state),
+            "model": id(session.state.model),
+            "transformer": id(session.state.transformer),
+            "text_encoder": id(session.state.text_encoder),
+            "vae": id(session.state.vae),
+        }
+        param_sample_after_g2 = {
+            "text_encoder": _first_param_ids(session.state.text_encoder),
+            "vae": _first_param_ids(session.state.vae),
+            "transformer_block0": _first_param_ids(blocks_live[0]),
+            "transformer_img_in": _first_param_ids(
+                getattr(session.state.transformer, "img_in", None)
+            ),
+        }
+        self.summary["runtime_state_id_stable"] = (
+            identity_after_g2["runtime_state"] == identity_before["runtime_state"]
+            and session.model_load_count == 1
+        )
+        self.summary["transformer_id_stable"] = (
+            identity_after_g2["transformer"] == identity_before["transformer"]
+            and param_sample_after_g2["transformer_block0"] == param_sample_before["transformer_block0"]
+        )
+        self.summary["text_encoder_id_stable"] = (
+            identity_after_g2["text_encoder"] == identity_before["text_encoder"]
+            and param_sample_after_g2["text_encoder"] == param_sample_before["text_encoder"]
+        )
+        self.summary["vae_id_stable"] = (
+            identity_after_g2["vae"] == identity_before["vae"]
+            and param_sample_after_g2["vae"] == param_sample_before["vae"]
+        )
+        identity_preserved_g2 = (
+            self.summary["runtime_state_id_stable"]
+            and self.summary["transformer_id_stable"]
+            and self.summary["text_encoder_id_stable"]
+            and self.summary["vae_id_stable"]
+        )
+        self.require("IDENTITY_PRESERVED_G2", identity_preserved_g2, "post-G2 identity drift")
+        print("IDENTITY_G2=PASS")
+
+        # --- G2 routing telemetry adjudication -------------------------------
+        g2_telemetry_path = Path(g2.evidence_paths.get("telemetry") or "")
+        _require(g2_telemetry_path.is_file(), "G2_TELEMETRY", f"missing: {g2_telemetry_path}")
+        g2_telemetry = parse_telemetry(str(g2_telemetry_path))
+
+        g2_blocked = _records_for(g2_telemetry, session.session_id, g2.inference_id, "block_forward")
