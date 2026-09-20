@@ -145,6 +145,20 @@ docs/                      bilingual usage documentation
 tests/                     CPU/static contract tests
 ```
 
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Usage](docs/usage.md)
+- [Python and CLI API](docs/api.md)
+- [Kaggle setup](docs/kaggle.md)
+- [Kaggle public demo procedure](docs/kaggle-public-demo.md)
+- [Limitations](docs/limitations.md)
+- [Provenance and authority](docs/provenance.md)
+- [Testing and validation](docs/testing.md)
+- [Contributing](.github/CONTRIBUTING.md)
+- [Security](.github/SECURITY.md)
+- [Support](.github/SUPPORT.md)
+
 ## Safety and failure behavior
 
 The public path fails closed when, among other cases:
@@ -163,4 +177,8 @@ The public path fails closed when, among other cases:
 
 ## License and upstream code
 
-Upstream Mage source is fetched from its pinned public Git commit at runtime rather than copied into this repository. Review the upstream repository and model licenses before redistribution or production use.
+This repository's original code and documentation are licensed under the [MIT License](LICENSE).
+
+Copyright (c) 2026 **Đăng Khoa <i.am@dangkhoa.dev>**.
+
+Upstream Mage source is fetched from its pinned public Git commit at runtime rather than copied into this repository. The upstream source and model artifacts remain subject to their own licenses and terms; review them before redistribution or production use.

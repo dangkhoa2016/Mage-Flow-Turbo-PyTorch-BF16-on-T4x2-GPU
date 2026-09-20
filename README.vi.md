@@ -145,6 +145,20 @@ docs/                      tài liệu sử dụng song ngữ
 tests/                     CPU/static contract tests
 ```
 
+## Tài liệu
+
+- [Kiến trúc](docs/architecture.vi.md)
+- [Cách sử dụng](docs/usage.vi.md)
+- [Python và CLI API](docs/api.vi.md)
+- [Thiết lập Kaggle](docs/kaggle.vi.md)
+- [Quy trình Kaggle public demo](docs/kaggle-public-demo.vi.md)
+- [Giới hạn](docs/limitations.vi.md)
+- [Provenance và authority](docs/provenance.vi.md)
+- [Testing và validation](docs/testing.vi.md)
+- [Đóng góp](.github/CONTRIBUTING.vi.md)
+- [Bảo mật](.github/SECURITY.vi.md)
+- [Hỗ trợ](.github/SUPPORT.vi.md)
+
 ## Safety và fail-closed
 
 Public path dừng fail-closed nếu, ví dụ:
@@ -163,4 +177,8 @@ Public path dừng fail-closed nếu, ví dụ:
 
 ## License và upstream code
 
-Upstream Mage source được lấy trực tiếp từ public Git commit đã pin khi chạy, thay vì copy vào repository này. Hãy kiểm tra license của upstream repository và model trước khi redistribution hoặc production use.
+Code và tài liệu nguyên bản của repository này được phát hành theo [MIT License](LICENSE).
+
+Copyright (c) 2026 **Đăng Khoa <i.am@dangkhoa.dev>**.
+
+Upstream Mage source được lấy trực tiếp từ public Git commit đã pin khi chạy, thay vì copy vào repository này. Upstream source và model artifact vẫn chịu license và điều khoản riêng; hãy kiểm tra trước khi redistribution hoặc production use.
