@@ -267,3 +267,68 @@ def _reuse_provenance(intended_root: Path) -> UpstreamMageProvenance:
         upstream_commit=UPSTREAM_COMMIT,
         package_version=PACKAGE_VERSION,
     )
+
+
+def bootstrap_upstream_mage(source_root: Optional[str] = None) -> UpstreamMageProvenance:
+    """Provision the pinned upstream ``mage_flow`` from the vendor tree.
+
+    Runs the full static gate sequence (1-7) through the import and symbol
+    gates (8-14) and returns an immutable provenance record (15).  Fail-closed
+    with the exact named failure codes from :data:`UPSTREAM_SOURCE_MISSING`
+    through :data:`UPSTREAM_SYMBOL_CONTRACT_MISMATCH`.
+    """
+    verify_upstream_source(source_root)
+    root = Path(source_root or default_source_root()).resolve()
+
+    if PACKAGE_NAME in sys.modules and not _existing_module_is_vendor(root):
+        existing = getattr(sys.modules[PACKAGE_NAME], "__file__", None)
+        _fail(
+            UPSTREAM_PREIMPORT_CONTAMINATION,
+            f"{PACKAGE_NAME} already imported from outside the vendor root: {existing}",
+        )
+
+    vendor_path = str(root)
+    if vendor_path not in sys.path:
+        sys.path.insert(0, vendor_path)
+
+    importlib.invalidate_caches()
+
+    try:
+        mage_flow = importlib.import_module(PACKAGE_NAME)
+    except Exception as exc:  # noqa: BLE001 - classified as import failure
+        _fail(UPSTREAM_IMPORT_FAILED, f"import mage_flow failed: {type(exc).__name__}: {exc}")
+
+    package_file = (root / PACKAGE_NAME / "__init__.py").resolve()
+    resolved_file = Path(getattr(mage_flow, "__file__", "") or "").resolve()
+    _require(
+        resolved_file == package_file,
+        UPSTREAM_MODULE_PATH_MISMATCH,
+        f"mage_flow.__file__ resolves to {resolved_file}, expected {package_file}",
+    )
+
+    _require(
+        getattr(mage_flow, "__version__", None) == PACKAGE_VERSION,
+        UPSTREAM_VERSION_MISMATCH,
+        f"mage_flow.__version__ is {getattr(mage_flow, '__version__', None)!r}, "
+        f"expected {PACKAGE_VERSION!r}",
+    )
+
+    _assert_symbols(mage_flow, list(_TOP_LEVEL_SYMBOLS), PACKAGE_NAME)
+
+    for deep_module, symbols in _DEEP_SYMBOLS.items():
+        try:
+            module = importlib.import_module(deep_module)
+        except Exception as exc:  # noqa: BLE001 - classified as symbol contract
+            _fail(
+                UPSTREAM_SYMBOL_CONTRACT_MISMATCH,
+                f"deep module import failed for {deep_module}: {type(exc).__name__}: {exc}",
+            )
+        _assert_symbols(module, symbols, deep_module)
+
+    return UpstreamMageProvenance(
+        source_root=str(root),
+        package_file=str(package_file),
+        upstream_repository=UPSTREAM_REPOSITORY,
+        upstream_commit=UPSTREAM_COMMIT,
+        package_version=PACKAGE_VERSION,
+    )
